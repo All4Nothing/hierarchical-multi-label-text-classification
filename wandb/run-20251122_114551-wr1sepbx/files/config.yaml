@@ -1,0 +1,99 @@
+_wandb:
+    value:
+        cli_version: 0.23.0
+        e:
+            80od5hbx6t4y0td4c8k31jertjryaccx:
+                codePath: taxoclass/main.py
+                codePathLocal: taxoclass/main.py
+                email: sd081104@gmail.com
+                executable: /opt/conda/envs/venv/bin/python
+                git:
+                    commit: f5fd4a57cfd23882a17dd26c30e58a457597b20b
+                    remote: https://github.com/All4Nothing/20252R0136DATA30400
+                host: ac532a34f907
+                os: Linux-5.15.0-139-generic-x86_64-with-glibc2.31
+                program: /workspace/yongjoo/20252R0136DATA30400/taxoclass/main.py
+                python: CPython 3.10.19
+                root: /workspace/yongjoo/20252R0136DATA30400
+                startedAt: "2025-11-22T11:45:51.522973Z"
+                writerId: 80od5hbx6t4y0td4c8k31jertjryaccx
+        m: []
+        python_version: 3.10.19
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 49
+                - 53
+            "2":
+                - 1
+                - 5
+                - 11
+                - 49
+                - 53
+            "3":
+                - 13
+                - 15
+                - 16
+            "4": 3.10.19
+            "5": 0.23.0
+            "6": 4.57.1
+            "12": 0.23.0
+            "13": linux-x86_64
+batch_size:
+    value: 64
+candidate_selection_power:
+    value: 2
+confidence_threshold_percentile:
+    value: 50
+device:
+    value: cuda:0
+doc_encoder_model:
+    value: bert-large-uncased
+doc_max_length:
+    value: 512
+embedding_dim:
+    value: 1024
+gnn_dropout:
+    value: 0.1
+gnn_hidden_dim:
+    value: 1024
+gnn_num_layers:
+    value: 4
+learning_rate:
+    value: 1e-05
+num_epochs:
+    value: 15
+num_workers:
+    value: 8
+seed:
+    value: 42
+self_train_epochs_per_iter:
+    value: 3
+self_train_iterations:
+    value: 5
+self_train_lr:
+    value: 5e-06
+self_train_temperature:
+    value: 2
+self_train_threshold:
+    value: 0.5
+similarity_batch_size:
+    value: 64
+similarity_model:
+    value: microsoft/deberta-large-mnli
+use_mixed_precision:
+    value: true
+use_test_in_stage1:
+    value: true
+use_test_in_stage2:
+    value: true
+use_test_in_stage3:
+    value: false
+use_test_in_stage4:
+    value: true
+warmup_steps:
+    value: 1000
+weight_decay:
+    value: 0.01

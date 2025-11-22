@@ -22,7 +22,7 @@ python quick_test.py
 `config.py` 파일을 열고 데이터 경로를 확인/수정하세요:
 
 ```python
-DATA_DIR = "../project_release/Amazon_products"
+DATA_DIR = "../Amazon_products"
 ```
 
 현재 설정:
@@ -127,7 +127,7 @@ run_self_training = False   # Self-training 건너뛰기
 
 ```bash
 # 데이터 경로 확인
-ls ../project_release/Amazon_products/
+ls ../Amazon_products/
 
 # config.py에서 DATA_DIR 경로 수정
 ```

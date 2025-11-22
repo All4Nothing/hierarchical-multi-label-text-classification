@@ -1,0 +1,23 @@
+2025-11-22 11:45:51,525 INFO    MainThread:92963 [wandb_setup.py:_flush():80] Current SDK version is 0.23.0
+2025-11-22 11:45:51,526 INFO    MainThread:92963 [wandb_setup.py:_flush():80] Configure stats pid to 92963
+2025-11-22 11:45:51,526 INFO    MainThread:92963 [wandb_setup.py:_flush():80] Loading settings from /root/.config/wandb/settings
+2025-11-22 11:45:51,526 INFO    MainThread:92963 [wandb_setup.py:_flush():80] Loading settings from /workspace/yongjoo/20252R0136DATA30400/wandb/settings
+2025-11-22 11:45:51,526 INFO    MainThread:92963 [wandb_setup.py:_flush():80] Loading settings from environment variables
+2025-11-22 11:45:51,526 INFO    MainThread:92963 [wandb_init.py:setup_run_log_directory():713] Logging user logs to /workspace/yongjoo/20252R0136DATA30400/wandb/run-20251122_114551-wr1sepbx/logs/debug.log
+2025-11-22 11:45:51,526 INFO    MainThread:92963 [wandb_init.py:setup_run_log_directory():714] Logging internal logs to /workspace/yongjoo/20252R0136DATA30400/wandb/run-20251122_114551-wr1sepbx/logs/debug-internal.log
+2025-11-22 11:45:51,526 INFO    MainThread:92963 [wandb_init.py:init():840] calling init triggers
+2025-11-22 11:45:51,526 INFO    MainThread:92963 [wandb_init.py:init():845] wandb.init called with sweep_config: {}
+config: {'seed': 42, 'device': 'cuda:0', 'similarity_model': 'microsoft/deberta-large-mnli', 'similarity_batch_size': 64, 'candidate_selection_power': 2, 'confidence_threshold_percentile': 50, 'doc_encoder_model': 'bert-large-uncased', 'doc_max_length': 512, 'embedding_dim': 1024, 'gnn_hidden_dim': 1024, 'gnn_num_layers': 4, 'gnn_dropout': 0.1, 'learning_rate': 1e-05, 'batch_size': 64, 'num_epochs': 15, 'warmup_steps': 1000, 'weight_decay': 0.01, 'self_train_iterations': 5, 'self_train_epochs_per_iter': 3, 'self_train_temperature': 2.0, 'self_train_threshold': 0.5, 'self_train_lr': 5e-06, 'use_mixed_precision': True, 'num_workers': 8, 'use_test_in_stage1': True, 'use_test_in_stage2': True, 'use_test_in_stage3': False, 'use_test_in_stage4': True, '_wandb': {}}
+2025-11-22 11:45:51,527 INFO    MainThread:92963 [wandb_init.py:init():888] starting backend
+2025-11-22 11:45:51,763 INFO    MainThread:92963 [wandb_init.py:init():891] sending inform_init request
+2025-11-22 11:45:51,775 INFO    MainThread:92963 [wandb_init.py:init():899] backend started and connected
+2025-11-22 11:45:51,778 INFO    MainThread:92963 [wandb_init.py:init():969] updated telemetry
+2025-11-22 11:45:51,791 INFO    MainThread:92963 [wandb_init.py:init():993] communicating run to backend with 90.0 second timeout
+2025-11-22 11:45:52,514 INFO    MainThread:92963 [wandb_init.py:init():1040] starting run threads in backend
+2025-11-22 11:45:52,635 INFO    MainThread:92963 [wandb_run.py:_console_start():2504] atexit reg
+2025-11-22 11:45:52,635 INFO    MainThread:92963 [wandb_run.py:_redirect():2352] redirect: wrap_raw
+2025-11-22 11:45:52,635 INFO    MainThread:92963 [wandb_run.py:_redirect():2421] Wrapping output streams.
+2025-11-22 11:45:52,635 INFO    MainThread:92963 [wandb_run.py:_redirect():2444] Redirects installed.
+2025-11-22 11:45:52,640 INFO    MainThread:92963 [wandb_init.py:init():1080] run started, returning control to user process
+2025-11-22 11:45:52,645 INFO    wandb-AsyncioManager-main:92963 [service_client.py:_forward_responses():80] Reached EOF.
+2025-11-22 11:45:52,645 INFO    wandb-AsyncioManager-main:92963 [mailbox.py:close():137] Closing mailbox, abandoning 2 handles.

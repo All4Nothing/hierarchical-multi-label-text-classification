@@ -164,7 +164,7 @@ class DocumentClassSimilarity:
         doc_id: int,
         similarity_matrix: np.ndarray,
         k: int = 10
-    ) -> List[Tuple[int, float]]:
+    ) -> List[tuple[int, float]]:
         """
         Get top-k most similar classes for a document
         

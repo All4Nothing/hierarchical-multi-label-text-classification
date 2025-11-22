@@ -1,0 +1,17 @@
+{
+  "os": "Linux-5.15.0-139-generic-x86_64-with-glibc2.31",
+  "python": "CPython 3.10.19",
+  "startedAt": "2025-11-22T11:45:51.522973Z",
+  "program": "/workspace/yongjoo/20252R0136DATA30400/taxoclass/main.py",
+  "codePath": "taxoclass/main.py",
+  "codePathLocal": "taxoclass/main.py",
+  "git": {
+    "remote": "https://github.com/All4Nothing/20252R0136DATA30400",
+    "commit": "f5fd4a57cfd23882a17dd26c30e58a457597b20b"
+  },
+  "email": "sd081104@gmail.com",
+  "root": "/workspace/yongjoo/20252R0136DATA30400",
+  "host": "ac532a34f907",
+  "executable": "/opt/conda/envs/venv/bin/python",
+  "writerId": "80od5hbx6t4y0td4c8k31jertjryaccx"
+}

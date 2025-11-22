@@ -151,18 +151,41 @@ def create_multi_label_matrix(
         1: positive, 0: negative, -1: ignore (descendants)
     """
     num_docs = len(doc_labels)
+    
+    # Validate and adjust num_classes if needed
+    if core_class_assignments:
+        max_core_class = max(core_class_assignments.values())
+        if max_core_class >= num_classes:
+            actual_num_classes = max_core_class + 1
+            print(f"⚠️  Warning: Max core class ID ({max_core_class}) >= num_classes ({num_classes})")
+            print(f"   Adjusting num_classes to {actual_num_classes}")
+            num_classes = actual_num_classes
+    
     label_matrix = np.zeros((num_docs, num_classes), dtype=np.float32)
     
     for doc_id, core_class in core_class_assignments.items():
         if doc_id >= num_docs:
             continue
         
+        # Validate core_class is within bounds
+        if core_class < 0 or core_class >= num_classes:
+            print(f"⚠️  Warning: Document {doc_id} has invalid core class ID {core_class} (valid range: 0-{num_classes-1}), skipping...")
+            continue
+        
         # Positive: core class + ancestors
         positive_classes = {core_class}
-        positive_classes.update(hierarchy.get_ancestors(core_class))
+        try:
+            ancestors = hierarchy.get_ancestors(core_class)
+            positive_classes.update(ancestors)
+        except (KeyError, AttributeError):
+            # If core_class not in hierarchy, skip ancestors
+            pass
         
         # Descendants (ignore)
-        descendants = hierarchy.get_descendants(core_class)
+        try:
+            descendants = hierarchy.get_descendants(core_class)
+        except (KeyError, AttributeError):
+            descendants = set()
         
         # Set labels
         for class_id in range(num_classes):
@@ -193,13 +216,45 @@ def create_ground_truth_matrix(
         Binary matrix (num_docs, num_classes)
     """
     num_docs = len(doc_labels)
+    
+    # Check if class IDs are within valid range
+    if doc_labels:
+        max_class_id = max(doc_labels)
+        min_class_id = min(doc_labels)
+        
+        # Adjust num_classes if needed (handle 0-based vs 1-based indexing)
+        if max_class_id >= num_classes:
+            # If max_class_id is 531 and num_classes is 531, we need 532 (0-531)
+            # Or if class IDs are 1-based (1-531), we need to adjust
+            actual_num_classes = max_class_id + 1
+            print(f"⚠️  Warning: Max class ID ({max_class_id}) >= num_classes ({num_classes})")
+            print(f"   Adjusting num_classes to {actual_num_classes}")
+            num_classes = actual_num_classes
+        elif min_class_id < 0:
+            print(f"⚠️  Warning: Min class ID ({min_class_id}) < 0, adjusting...")
+            # Shift all IDs to be non-negative
+            shift = -min_class_id
+            doc_labels = [label + shift for label in doc_labels]
+            num_classes += shift
+            print(f"   Shifted class IDs by {shift}, new num_classes: {num_classes}")
+    
     gt_matrix = np.zeros((num_docs, num_classes), dtype=np.int32)
     
     for doc_id, label_class in enumerate(doc_labels):
+        # Validate class ID is within bounds
+        if label_class < 0 or label_class >= num_classes:
+            print(f"⚠️  Warning: Document {doc_id} has invalid class ID {label_class} (valid range: 0-{num_classes-1}), skipping...")
+            continue
+        
         # Mark the label and all its ancestors as positive
         gt_matrix[doc_id, label_class] = 1
-        for ancestor in hierarchy.get_ancestors(label_class):
-            gt_matrix[doc_id, ancestor] = 1
+        try:
+            for ancestor in hierarchy.get_ancestors(label_class):
+                if 0 <= ancestor < num_classes:
+                    gt_matrix[doc_id, ancestor] = 1
+        except (KeyError, AttributeError):
+            # If class ID not in hierarchy, skip ancestors
+            pass
     
     return gt_matrix
 

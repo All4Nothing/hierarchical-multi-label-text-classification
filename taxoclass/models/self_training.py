@@ -10,6 +10,13 @@ from typing import Dict, List
 from tqdm import tqdm
 import os
 
+# Wandb import (optional)
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 
 class SelfTrainer:
     """Self-training for TaxoClassifier"""
@@ -25,7 +32,8 @@ class SelfTrainer:
         temperature: float = 2.0,
         threshold: float = 0.5,
         learning_rate: float = 1e-5,
-        save_dir: str = "./saved_models"
+        save_dir: str = "./saved_models",
+        use_wandb: bool = False
     ):
         """
         Initialize self-trainer
@@ -41,6 +49,7 @@ class SelfTrainer:
             threshold: Threshold for prediction filtering
             learning_rate: Learning rate for self-training
             save_dir: Directory to save models
+            use_wandb: Whether to use wandb logging
         """
         self.model = model.to(device)
         self.unlabeled_loader = unlabeled_loader
@@ -52,6 +61,7 @@ class SelfTrainer:
         self.threshold = threshold
         self.learning_rate = learning_rate
         self.save_dir = save_dir
+        self.use_wandb = use_wandb and WANDB_AVAILABLE
         
         os.makedirs(save_dir, exist_ok=True)
     
@@ -215,6 +225,14 @@ class SelfTrainer:
             
             avg_loss = total_loss / num_batches
             print(f"  Epoch {epoch+1} - Avg Loss: {avg_loss:.4f}")
+            
+            # Log to wandb
+            if self.use_wandb:
+                wandb.log({
+                    "stage4/self_train_loss": avg_loss,
+                    "stage4/iteration": iteration + 1,
+                    "stage4/epoch": epoch + 1,
+                })
     
     def self_train(self):
         """
@@ -235,9 +253,23 @@ class SelfTrainer:
             
             # Print statistics
             num_confident = (predictions.max(dim=1)[0] > self.threshold).sum().item()
-            print(f"Confident predictions: {num_confident}/{len(predictions)} ({100*num_confident/len(predictions):.2f}%)")
-            print(f"Avg max prediction: {predictions.max(dim=1)[0].mean():.4f}")
-            print(f"Avg target entropy: {-(target_distribution * torch.log(target_distribution + 1e-10)).sum(dim=1).mean():.4f}")
+            confidence_ratio = 100 * num_confident / len(predictions)
+            avg_max_pred = predictions.max(dim=1)[0].mean().item()
+            avg_entropy = -(target_distribution * torch.log(target_distribution + 1e-10)).sum(dim=1).mean().item()
+            
+            print(f"Confident predictions: {num_confident}/{len(predictions)} ({confidence_ratio:.2f}%)")
+            print(f"Avg max prediction: {avg_max_pred:.4f}")
+            print(f"Avg target entropy: {avg_entropy:.4f}")
+            
+            # Log to wandb
+            if self.use_wandb:
+                wandb.log({
+                    "stage4/confident_predictions": num_confident,
+                    "stage4/confidence_ratio": confidence_ratio,
+                    "stage4/avg_max_prediction": avg_max_pred,
+                    "stage4/avg_target_entropy": avg_entropy,
+                    "stage4/iteration": iteration + 1,
+                })
             
             # Step 3: Train model with target distribution
             self.train_iteration(iteration, target_distribution)

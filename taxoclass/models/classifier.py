@@ -11,6 +11,13 @@ from typing import Dict, List, Tuple
 from tqdm import tqdm
 import os
 
+# Wandb import (optional)
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 
 class GNNEncoder(nn.Module):
     """Graph Neural Network for encoding class hierarchy"""
@@ -266,7 +273,8 @@ class TaxoClassifierTrainer:
         num_epochs: int = 10,
         warmup_steps: int = 500,
         weight_decay: float = 0.01,
-        save_dir: str = "./saved_models"
+        save_dir: str = "./saved_models",
+        use_wandb: bool = False
     ):
         """
         Initialize trainer
@@ -282,6 +290,7 @@ class TaxoClassifierTrainer:
             warmup_steps: Warmup steps for scheduler
             weight_decay: Weight decay
             save_dir: Directory to save models
+            use_wandb: Whether to use wandb logging
         """
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -290,6 +299,7 @@ class TaxoClassifierTrainer:
         self.device = device
         self.num_epochs = num_epochs
         self.save_dir = save_dir
+        self.use_wandb = use_wandb and WANDB_AVAILABLE
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -311,6 +321,9 @@ class TaxoClassifierTrainer:
         
         # Best validation loss
         self.best_val_loss = float('inf')
+        
+        # Global step counter for wandb
+        self.global_step = 0
         
         os.makedirs(save_dir, exist_ok=True)
     
@@ -373,6 +386,16 @@ class TaxoClassifierTrainer:
             # Update metrics
             total_loss += loss.item()
             num_batches += 1
+            self.global_step += 1
+            
+            # Log to wandb
+            if self.use_wandb and self.global_step % 10 == 0:
+                current_lr = self.scheduler.get_last_lr()[0]
+                wandb.log({
+                    "stage3/train_loss": loss.item(),
+                    "stage3/learning_rate": current_lr,
+                    "stage3/epoch": epoch,
+                }, step=self.global_step)
             
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
@@ -416,6 +439,21 @@ class TaxoClassifierTrainer:
             val_loss = self.validate()
             
             print(f"Epoch {epoch+1}/{self.num_epochs} - Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            
+            # Log to wandb
+            if self.use_wandb:
+                wandb.log({
+                    "stage3/epoch_train_loss": train_loss,
+                    "stage3/epoch_val_loss": val_loss,
+                    "stage3/epoch": epoch + 1,
+                }, step=self.global_step)
+                
+                # Log best model update
+                if val_loss < self.best_val_loss:
+                    wandb.log({
+                        "stage3/best_val_loss": val_loss,
+                        "stage3/best_epoch": epoch + 1,
+                    }, step=self.global_step)
             
             # Save best model
             if val_loss < self.best_val_loss:
