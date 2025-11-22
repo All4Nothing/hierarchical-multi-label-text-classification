@@ -192,7 +192,8 @@ class FastSimilarityCalculator:
         self,
         model_name: str = "sentence-transformers/all-mpnet-base-v2",
         device: str = "cuda",
-        batch_size: int = 32
+        batch_size: int = 32,
+        cache_dir: str = "./cache"
     ):
         """
         Initialize fast similarity calculator using sentence embeddings
@@ -201,12 +202,14 @@ class FastSimilarityCalculator:
             model_name: Sentence transformer model
             device: Device to run on
             batch_size: Batch size
+            cache_dir: Directory to cache results
         """
         from sentence_transformers import SentenceTransformer
         
         self.model_name = model_name
         self.device = device
         self.batch_size = batch_size
+        self.cache_dir = cache_dir
         
         print(f"Loading sentence transformer: {model_name}")
         self.model = SentenceTransformer(model_name)
@@ -215,7 +218,8 @@ class FastSimilarityCalculator:
     def compute_similarity_matrix(
         self,
         documents: List[str],
-        class_names: Dict[int, str]
+        class_names: Dict[int, str],
+        use_cache: bool = True
     ) -> np.ndarray:
         """
         Compute cosine similarity between documents and class names
@@ -223,12 +227,24 @@ class FastSimilarityCalculator:
         Args:
             documents: List of document texts
             class_names: Dictionary of class names
+            use_cache: Whether to use cached results
         
         Returns:
             Similarity matrix (num_docs, num_classes)
         """
         num_docs = len(documents)
         num_classes = len(class_names)
+        
+        # Check cache
+        cache_file = os.path.join(
+            self.cache_dir,
+            f"fast_similarity_matrix_{num_docs}docs_{num_classes}classes.pkl"
+        )
+        
+        if use_cache and os.path.exists(cache_file):
+            print(f"Loading cached similarity matrix from {cache_file}")
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
         
         print(f"Encoding {num_docs} documents...")
         doc_embeddings = self.model.encode(
@@ -257,5 +273,14 @@ class FastSimilarityCalculator:
             dim=2
         )
         
-        return similarity_matrix.cpu().numpy()
+        similarity_matrix = similarity_matrix.cpu().numpy()
+        
+        # Save to cache
+        if use_cache:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            with open(cache_file, 'wb') as f:
+                pickle.dump(similarity_matrix, f)
+            print(f"Saved similarity matrix to {cache_file}")
+        
+        return similarity_matrix
 

@@ -195,7 +195,8 @@ def main():
         print("\nUsing fast similarity calculator (sentence transformers)...")
         similarity_calculator = FastSimilarityCalculator(
             device=device,
-            batch_size=Config.SIMILARITY_BATCH_SIZE
+            batch_size=Config.SIMILARITY_BATCH_SIZE,
+            cache_dir=Config.CACHE_DIR
         )
     else:
         print("\nUsing textual entailment model (RoBERTa-MNLI)...")
@@ -223,7 +224,7 @@ def main():
     similarity_matrix_all = similarity_calculator.compute_similarity_matrix(
         documents=stage1_documents,
         class_names=hierarchy.id_to_name,
-        use_cache=True if hasattr(similarity_calculator, 'cache_dir') else False
+        use_cache=True
     )
     
     # Split similarity matrix back to train/test
