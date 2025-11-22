@@ -4,7 +4,7 @@ Stage 1: Document-Class Similarity Calculation using Textual Entailment
 import torch
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from tqdm import tqdm
 import os
 import pickle
@@ -164,7 +164,7 @@ class DocumentClassSimilarity:
         doc_id: int,
         similarity_matrix: np.ndarray,
         k: int = 10
-    ) -> List[tuple[int, float]]:
+    ) -> List[Tuple[int, float]]:
         """
         Get top-k most similar classes for a document
         
