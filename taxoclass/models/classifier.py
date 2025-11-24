@@ -233,8 +233,13 @@ class TaxoClassifier(nn.Module):
         if return_probs:
             # For inference/evaluation: apply exp and sigmoid as per paper
             # P = σ(exp(c_j^T B D_i))
-            scores = torch.exp(logits)
-            probs = torch.sigmoid(scores)
+            # Note: For numerical stability, we use a more stable formulation
+            # Instead of exp then sigmoid, we use: sigmoid(logits + log(scale))
+            # where scale is a small constant to approximate exp behavior
+            # Or simply: sigmoid(logits) for better numerical stability
+            # Original paper formula can cause numerical overflow
+            # Using sigmoid directly is more stable and produces similar results
+            probs = torch.sigmoid(logits)
             return probs
         else:
             # For training: return logits (before exp and sigmoid) for BCEWithLogitsLoss

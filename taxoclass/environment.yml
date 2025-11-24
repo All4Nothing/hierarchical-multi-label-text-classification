@@ -1,0 +1,7 @@
+name: venv
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+prefix: /opt/conda/envs/venv
