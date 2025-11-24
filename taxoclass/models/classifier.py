@@ -31,7 +31,7 @@ class GNNEncoder(nn.Module):
         dropout: float = 0.1
     ):
         """
-        Initialize GNN encoder
+        Initialize 3 encoder
         
         Args:
             in_channels: Input feature dimension
@@ -205,7 +205,7 @@ class TaxoClassifier(nn.Module):
         class_emb = self.class_encoder(self.class_embeddings, edge_index)
         return class_emb
     
-    def compute_matching_scores(self, doc_emb, class_emb):
+    def compute_matching_scores(self, doc_emb, class_emb, return_probs=False):
         """
         Compute matching scores between documents and classes
         
@@ -214,9 +214,10 @@ class TaxoClassifier(nn.Module):
         Args:
             doc_emb: Document embeddings (batch_size, embedding_dim)
             class_emb: Class embeddings (num_classes, embedding_dim)
+            return_probs: If True, return probabilities (for inference). If False, return logits (for training)
         
         Returns:
-            Matching probabilities (batch_size, num_classes)
+            Matching logits or probabilities (batch_size, num_classes)
         """
         # Compute c_j^T B D_i
         # doc_emb: (batch, emb_dim)
@@ -227,15 +228,21 @@ class TaxoClassifier(nn.Module):
         doc_transformed = torch.matmul(doc_emb, self.matching_matrix)
         
         # (batch, emb_dim) @ (num_classes, emb_dim)^T = (batch, num_classes)
-        scores = torch.matmul(doc_transformed, class_emb.t())
+        logits = torch.matmul(doc_transformed, class_emb.t())
         
-        # Apply exp and sigmoid
-        scores = torch.exp(scores)
-        probs = torch.sigmoid(scores)
-        
-        return probs
+        if return_probs:
+            # For inference/evaluation: apply exp and sigmoid as per paper
+            # P = σ(exp(c_j^T B D_i))
+            scores = torch.exp(logits)
+            probs = torch.sigmoid(scores)
+            return probs
+        else:
+            # For training: return logits (before exp and sigmoid) for BCEWithLogitsLoss
+            # Note: Paper uses exp, but for numerical stability and compatibility with
+            # BCEWithLogitsLoss, we use raw logits. The exp can be learned implicitly.
+            return logits
     
-    def forward(self, input_ids, attention_mask, edge_index):
+    def forward(self, input_ids, attention_mask, edge_index, return_probs=False):
         """
         Forward pass
         
@@ -243,9 +250,10 @@ class TaxoClassifier(nn.Module):
             input_ids: Input token IDs (batch_size, seq_len)
             attention_mask: Attention mask (batch_size, seq_len)
             edge_index: Edge indices (2, num_edges)
+            return_probs: If True, return probabilities. If False, return logits (for training)
         
         Returns:
-            Prediction probabilities (batch_size, num_classes)
+            Prediction logits or probabilities (batch_size, num_classes)
         """
         # Encode documents
         doc_emb = self.encode_documents(input_ids, attention_mask)
@@ -254,9 +262,9 @@ class TaxoClassifier(nn.Module):
         class_emb = self.encode_classes(edge_index)
         
         # Compute matching scores
-        probs = self.compute_matching_scores(doc_emb, class_emb)
+        output = self.compute_matching_scores(doc_emb, class_emb, return_probs=return_probs)
         
-        return probs
+        return output
 
 
 class TaxoClassifierTrainer:
@@ -274,7 +282,9 @@ class TaxoClassifierTrainer:
         warmup_steps: int = 500,
         weight_decay: float = 0.01,
         save_dir: str = "./saved_models",
-        use_wandb: bool = False
+        use_wandb: bool = False,
+        use_mixed_precision: bool = False,
+        gradient_accumulation_steps: int = 1
     ):
         """
         Initialize trainer
@@ -291,6 +301,8 @@ class TaxoClassifierTrainer:
             weight_decay: Weight decay
             save_dir: Directory to save models
             use_wandb: Whether to use wandb logging
+            use_mixed_precision: Whether to use mixed precision training
+            gradient_accumulation_steps: Number of gradient accumulation steps
         """
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -300,6 +312,15 @@ class TaxoClassifierTrainer:
         self.num_epochs = num_epochs
         self.save_dir = save_dir
         self.use_wandb = use_wandb and WANDB_AVAILABLE
+        self.use_mixed_precision = use_mixed_precision
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        
+        # Mixed precision scaler
+        if use_mixed_precision:
+            self.scaler = torch.cuda.amp.GradScaler()
+            print("✅ Mixed precision training enabled")
+        else:
+            self.scaler = None
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -308,16 +329,16 @@ class TaxoClassifierTrainer:
             weight_decay=weight_decay
         )
         
-        # Scheduler
-        total_steps = len(train_loader) * num_epochs
+        # Scheduler (adjust for gradient accumulation)
+        total_steps = (len(train_loader) // gradient_accumulation_steps) * num_epochs
         self.scheduler = get_linear_schedule_with_warmup(
             self.optimizer,
             num_warmup_steps=warmup_steps,
             num_training_steps=total_steps
         )
         
-        # Loss function
-        self.criterion = nn.BCELoss(reduction='none')
+        # Loss function: Use BCEWithLogitsLoss for mixed precision compatibility
+        self.criterion = nn.BCEWithLogitsLoss(reduction='none')
         
         # Best validation loss
         self.best_val_loss = float('inf')
@@ -326,13 +347,17 @@ class TaxoClassifierTrainer:
         self.global_step = 0
         
         os.makedirs(save_dir, exist_ok=True)
+        
+        if gradient_accumulation_steps > 1:
+            print(f"✅ Gradient accumulation enabled: {gradient_accumulation_steps} steps")
+            print(f"   Effective batch size: {train_loader.batch_size * gradient_accumulation_steps}")
     
     def compute_loss(self, predictions, labels):
         """
         Compute loss with masking
         
         Args:
-            predictions: Predicted probabilities (batch_size, num_classes)
+            predictions: Predicted logits (batch_size, num_classes)
             labels: Ground truth labels (batch_size, num_classes)
                     1: positive, 0: negative, -1: ignore
         
@@ -345,7 +370,7 @@ class TaxoClassifierTrainer:
         # Convert labels to 0/1
         binary_labels = torch.clamp(labels, 0, 1)
         
-        # Compute BCE loss
+        # Compute BCEWithLogitsLoss (handles sigmoid internally)
         loss = self.criterion(predictions, binary_labels)
         
         # Apply mask
@@ -364,27 +389,48 @@ class TaxoClassifierTrainer:
         
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.num_epochs}")
         
-        for batch in pbar:
+        self.optimizer.zero_grad()  # Zero grad at start of epoch
+        
+        for batch_idx, batch in enumerate(pbar):
             # Move to device
             input_ids = batch['input_ids'].to(self.device)
             attention_mask = batch['attention_mask'].to(self.device)
             labels = batch['labels'].to(self.device)
             
-            # Forward pass
-            predictions = self.model(input_ids, attention_mask, self.edge_index)
-            
-            # Compute loss
-            loss = self.compute_loss(predictions, labels)
+            # Forward pass with mixed precision
+            if self.use_mixed_precision:
+                with torch.amp.autocast('cuda'):
+                    predictions = self.model(input_ids, attention_mask, self.edge_index, return_probs=False)
+                    loss = self.compute_loss(predictions, labels)
+                    loss = loss / self.gradient_accumulation_steps  # Scale loss for accumulation
+            else:
+                predictions = self.model(input_ids, attention_mask, self.edge_index, return_probs=False)
+                loss = self.compute_loss(predictions, labels)
+                loss = loss / self.gradient_accumulation_steps  # Scale loss for accumulation
             
             # Backward pass
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
-            self.scheduler.step()
+            if self.use_mixed_precision:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
             
-            # Update metrics
-            total_loss += loss.item()
+            # Update weights every gradient_accumulation_steps
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                if self.use_mixed_precision:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+            
+            # Update metrics (use unscaled loss for logging)
+            unscaled_loss = loss.item() * self.gradient_accumulation_steps
+            total_loss += unscaled_loss
             num_batches += 1
             self.global_step += 1
             
@@ -415,8 +461,8 @@ class TaxoClassifierTrainer:
                 attention_mask = batch['attention_mask'].to(self.device)
                 labels = batch['labels'].to(self.device)
                 
-                # Forward pass
-                predictions = self.model(input_ids, attention_mask, self.edge_index)
+                # Forward pass (return logits for loss computation)
+                predictions = self.model(input_ids, attention_mask, self.edge_index, return_probs=False)
                 
                 # Compute loss
                 loss = self.compute_loss(predictions, labels)

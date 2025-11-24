@@ -305,7 +305,7 @@ def evaluate_model(
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             
-            predictions = model(input_ids, attention_mask, edge_index)
+            predictions = model(input_ids, attention_mask, edge_index, return_probs=True)
             all_predictions.append(predictions.cpu().numpy())
     
     predictions = np.vstack(all_predictions)
@@ -369,8 +369,8 @@ def predict_top_k_classes(
             input_ids = encodings['input_ids'].to(device)
             attention_mask = encodings['attention_mask'].to(device)
             
-            # Predict
-            predictions = model(input_ids, attention_mask, edge_index)
+            # Predict (return probabilities for inference)
+            predictions = model(input_ids, attention_mask, edge_index, return_probs=True)
             predictions = predictions.cpu().numpy()
             
             # Get top-k for each document

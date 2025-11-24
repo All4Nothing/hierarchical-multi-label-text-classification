@@ -151,26 +151,37 @@ def main():
     test_documents = test_corpus.get_all_texts()
     test_labels = test_corpus.get_all_labels()
     
-    # Calculate actual number of classes based on hierarchy and labels
-    # Use actual max class ID + 1 to handle 0-based indexing correctly
+    # Calculate actual number of classes based on hierarchy
+    # Priority: hierarchy.num_classes > max class ID in hierarchy > max label ID
     if hierarchy.id_to_name:
         actual_max_class_id = max(hierarchy.id_to_name.keys())
-        actual_num_classes = actual_max_class_id + 1
+        # Use hierarchy's num_classes if available, otherwise max_id + 1
+        if hasattr(hierarchy, 'num_classes') and hierarchy.num_classes > 0:
+            actual_num_classes = max(hierarchy.num_classes, actual_max_class_id + 1)
+        else:
+            actual_num_classes = actual_max_class_id + 1
     else:
-        actual_num_classes = hierarchy.num_classes
+        actual_num_classes = hierarchy.num_classes if hasattr(hierarchy, 'num_classes') else 0
     
-    # Also check train and test labels for any out-of-range IDs
+    # Validate train and test labels (but don't let them override hierarchy)
     if train_labels:
         train_max_id = max(train_labels)
         if train_max_id >= actual_num_classes:
-            actual_num_classes = train_max_id + 1
-            print(f"⚠️  Warning: Train labels contain class ID {train_max_id}, adjusting num_classes to {actual_num_classes}")
+            # Only warn, don't automatically adjust (hierarchy is source of truth)
+            print(f"⚠️  Warning: Train labels contain class ID {train_max_id} >= num_classes ({actual_num_classes})")
+            print(f"   This may indicate a data issue. Using hierarchy-based num_classes: {actual_num_classes}")
     
     if test_labels:
         test_max_id = max(test_labels)
         if test_max_id >= actual_num_classes:
-            actual_num_classes = test_max_id + 1
-            print(f"⚠️  Warning: Test labels contain class ID {test_max_id}, adjusting num_classes to {actual_num_classes}")
+            print(f"⚠️  Warning: Test labels contain class ID {test_max_id} >= num_classes ({actual_num_classes})")
+            print(f"   This may indicate a data issue. Using hierarchy-based num_classes: {actual_num_classes}")
+    
+    # Final validation: ensure num_classes is reasonable
+    if actual_num_classes > 10000:
+        print(f"⚠️  CRITICAL: num_classes ({actual_num_classes}) seems too large!")
+        print(f"   This may indicate a calculation error. Using hierarchy.num_classes: {hierarchy.num_classes}")
+        actual_num_classes = hierarchy.num_classes
     
     print(f"Using num_classes: {actual_num_classes} (hierarchy.num_classes: {hierarchy.num_classes})")
     
@@ -284,11 +295,15 @@ def main():
     
     # Log to wandb
     if use_wandb:
-        total_docs_with_core = sum(len(docs) for docs in core_classes.values())
+        # core_classes is {doc_id: core_class_id}
+        total_docs_with_core = len(core_classes)
+        unique_core_classes = len(set(core_classes.values()))
+        avg_docs_per_core_class = total_docs_with_core / unique_core_classes if unique_core_classes > 0 else 0
+        
         wandb.log({
-            "stage2/num_core_classes": len(core_classes),
+            "stage2/num_core_classes": unique_core_classes,
             "stage2/total_docs_with_core": total_docs_with_core,
-            "stage2/avg_docs_per_core_class": total_docs_with_core / len(core_classes) if core_classes else 0,
+            "stage2/avg_docs_per_core_class": avg_docs_per_core_class,
             "stage2/num_documents": len(stage2_documents),
             "stage2/use_test_data": Config.USE_TEST_IN_STAGE2 and Config.USE_TEST_IN_STAGE1,
         })
@@ -445,7 +460,9 @@ def main():
         warmup_steps=Config.WARMUP_STEPS,
         weight_decay=Config.WEIGHT_DECAY,
         save_dir=Config.MODEL_SAVE_DIR,
-        use_wandb=use_wandb
+        use_wandb=use_wandb,
+        use_mixed_precision=Config.USE_MIXED_PRECISION,
+        gradient_accumulation_steps=getattr(Config, 'GRADIENT_ACCUMULATION_STEPS', 1)
     )
     
     # Train model

@@ -1,0 +1,131 @@
+_wandb:
+    value:
+        cli_version: 0.23.0
+        e:
+            soclohfd3qyutjnbe1ltq5y0zcvl43x9:
+                codePath: taxoclass/main.py
+                codePathLocal: main.py
+                cpu_count: 24
+                cpu_count_logical: 24
+                cudaVersion: "12.8"
+                disk:
+                    /:
+                        total: "943412031488"
+                        used: "856955215872"
+                email: sd081104@gmail.com
+                executable: /opt/conda/envs/venv/bin/python
+                git:
+                    commit: 6dd29e422bf14d1d8dc6f8a8903f989e9a10e0eb
+                    remote: https://github.com/All4Nothing/20252R0136DATA30400
+                gpu: NVIDIA RTX 6000 Ada Generation
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-7186ee74-beba-38cc-131b-a1a9bca80143
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-ba0decd6-834a-e488-a769-aad2c066583e
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-d580c914-90cc-be06-d234-db29b3866f22
+                    - architecture: Ada
+                      cudaCores: 18176
+                      memoryTotal: "51527024640"
+                      name: NVIDIA RTX 6000 Ada Generation
+                      uuid: GPU-eeeff9f3-91ee-c2f8-f1b8-880ca9333b08
+                host: ac532a34f907
+                memory:
+                    total: "201364070400"
+                os: Linux-5.15.0-139-generic-x86_64-with-glibc2.31
+                program: /workspace/yongjoo/20252R0136DATA30400/taxoclass/main.py
+                python: CPython 3.10.19
+                root: /workspace/yongjoo/20252R0136DATA30400/taxoclass
+                startedAt: "2025-11-22T15:08:28.649735Z"
+                writerId: soclohfd3qyutjnbe1ltq5y0zcvl43x9
+        m: []
+        python_version: 3.10.19
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 49
+                - 53
+            "2":
+                - 1
+                - 5
+                - 11
+                - 49
+                - 53
+            "3":
+                - 13
+                - 15
+                - 16
+            "4": 3.10.19
+            "5": 0.23.0
+            "6": 4.57.1
+            "12": 0.23.0
+            "13": linux-x86_64
+batch_size:
+    value: 64
+candidate_selection_power:
+    value: 2
+confidence_threshold_percentile:
+    value: 50
+device:
+    value: cuda
+doc_encoder_model:
+    value: bert-large-uncased
+doc_max_length:
+    value: 512
+embedding_dim:
+    value: 1024
+gnn_dropout:
+    value: 0.1
+gnn_hidden_dim:
+    value: 1024
+gnn_num_layers:
+    value: 4
+learning_rate:
+    value: 1e-05
+num_epochs:
+    value: 15
+num_workers:
+    value: 8
+seed:
+    value: 42
+self_train_epochs_per_iter:
+    value: 3
+self_train_iterations:
+    value: 5
+self_train_lr:
+    value: 5e-06
+self_train_temperature:
+    value: 2
+self_train_threshold:
+    value: 0.5
+similarity_batch_size:
+    value: 64
+similarity_model:
+    value: microsoft/deberta-large-mnli
+use_mixed_precision:
+    value: true
+use_test_in_stage1:
+    value: true
+use_test_in_stage2:
+    value: true
+use_test_in_stage3:
+    value: false
+use_test_in_stage4:
+    value: true
+warmup_steps:
+    value: 1000
+weight_decay:
+    value: 0.01

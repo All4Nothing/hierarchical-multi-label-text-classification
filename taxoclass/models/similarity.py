@@ -265,13 +265,26 @@ class FastSimilarityCalculator:
             device=self.device
         )
         
-        # Compute cosine similarity
+        # Compute cosine similarity in batches to avoid OOM
         print("Computing similarity matrix...")
-        similarity_matrix = torch.nn.functional.cosine_similarity(
-            doc_embeddings.unsqueeze(1),
-            class_embeddings.unsqueeze(0),
-            dim=2
-        )
+        num_docs = doc_embeddings.shape[0]
+        num_classes = class_embeddings.shape[0]
+        similarity_matrix = torch.zeros((num_docs, num_classes), device=self.device)
+        
+        # Normalize embeddings for cosine similarity
+        doc_embeddings = torch.nn.functional.normalize(doc_embeddings, p=2, dim=1)
+        class_embeddings = torch.nn.functional.normalize(class_embeddings, p=2, dim=1)
+        
+        # Process documents in batches
+        doc_batch_size = 1000  # Process 1000 documents at a time
+        for i in tqdm(range(0, num_docs, doc_batch_size), desc="Computing similarity"):
+            end_idx = min(i + doc_batch_size, num_docs)
+            doc_batch = doc_embeddings[i:end_idx]  # (batch_size, embedding_dim)
+            
+            # Compute similarity: (batch_size, embedding_dim) @ (embedding_dim, num_classes)
+            # This is more memory efficient than broadcasting
+            batch_similarity = torch.matmul(doc_batch, class_embeddings.T)  # (batch_size, num_classes)
+            similarity_matrix[i:end_idx] = batch_similarity
         
         similarity_matrix = similarity_matrix.cpu().numpy()
         

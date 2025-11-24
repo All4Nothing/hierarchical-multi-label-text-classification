@@ -20,7 +20,7 @@ class Config:
     # Stage 1: Similarity Calculation
     SIMILARITY_MODEL = "microsoft/deberta-large-mnli"  # DeBERTa-large for better performance
     SIMILARITY_BATCH_SIZE = 64  # A6000 can handle larger batches (16 -> 64)
-    SIMILARITY_MAX_LENGTH = 256
+    SIMILARITY_MAX_LENGTH = 128
     HYPOTHESIS_TEMPLATE = "This document is about {class_name}"
     
     # Stage 2: Core Class Mining
@@ -36,7 +36,8 @@ class Config:
     GNN_DROPOUT = 0.1
     
     LEARNING_RATE = 1e-5  # Lower LR for larger model stability (2e-5 -> 1e-5)
-    BATCH_SIZE = 64  # 4x larger batch size for A6000 (32 -> 64)
+    BATCH_SIZE = 16  # Reduced for memory efficiency (64 -> 16)
+    GRADIENT_ACCUMULATION_STEPS = 4  # Effective batch size = 16 * 4 = 64
     NUM_EPOCHS = 15  # More epochs with larger model (10 -> 15)
     WARMUP_STEPS = 1000  # More warmup steps (500 -> 1000)
     WEIGHT_DECAY = 0.01
@@ -56,7 +57,7 @@ class Config:
     USE_TEST_IN_STAGE4 = True   # Self-training (gradual, pseudo-label based)
     
     # Device
-    DEVICE = "cuda:0"  # or "cpu", "mps"
+    DEVICE = "cuda"  # or "cpu", "mps"
     
     # Random seed
     SEED = 42
@@ -74,7 +75,7 @@ class Config:
     # Weights & Biases (wandb) Settings
     USE_WANDB = True  # Enable wandb logging
     WANDB_PROJECT = "taxoclass-hierarchical"  # wandb project name
-    WANDB_ENTITY = None  # wandb entity (team name), None for personal
+    WANDB_ENTITY = "all4nothing-korea-university"  # wandb entity (team name), None for personal
     WANDB_RUN_NAME = None  # Run name (auto-generated if None)
     WANDB_TAGS = ["hierarchical", "taxonomy", "gnn"]  # Tags for organization
     WANDB_LOG_INTERVAL = 10  # Log every N steps
