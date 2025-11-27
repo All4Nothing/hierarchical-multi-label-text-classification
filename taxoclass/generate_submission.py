@@ -219,7 +219,6 @@ def predict_classes(
     edge_index: torch.Tensor,
     device: str,
     threshold: float = 0.5,
-    top_k: int = None
 ) -> np.ndarray:
     """
     Generate predictions for test set
@@ -230,7 +229,6 @@ def predict_classes(
         edge_index: Hierarchy edge index
         device: Device
         threshold: Probability threshold for binary classification
-        top_k: If specified, return top-k classes instead of threshold-based
         
     Returns:
         Probability predictions array (num_samples, num_classes)
@@ -256,9 +254,8 @@ def generate_submission(
     test_corpus_path: str = None,
     output_path: str = "submission.csv",
     threshold: float = 0.5,
-    top_k: int = None,
-    min_labels: int = 1,
-    max_labels: int = None,  # No limit by default
+    min_labels: int = 2,
+    max_labels: int = 3,  # Kaggle rule: at least 2 and at most 3 labels
     use_hierarchical_top1: bool = False,
     use_hierarchical_confidence: bool = False,
     confidence_threshold: float = 0.5
@@ -271,7 +268,6 @@ def generate_submission(
         test_corpus_path: Path to test corpus file
         output_path: Output submission file path
         threshold: Probability threshold for predictions
-        top_k: If specified, use top-k instead of threshold
         min_labels: Minimum number of labels per sample
         max_labels: Maximum number of labels per sample
     """
@@ -301,7 +297,9 @@ def generate_submission(
     model = load_model(model_path, hierarchy, device)
     
     # Get edge index
-    edge_index = torch.LongTensor(hierarchy.get_edge_index()).to(device)
+    edge_index = torch.LongTensor(
+        hierarchy.get_edge_index(bidirectional=Config.GNN_BIDIRECTIONAL_EDGES)
+    ).to(device)
     
     # Load test corpus
     if test_corpus_path is None:
@@ -352,7 +350,6 @@ def generate_submission(
         edge_index=edge_index,
         device=device,
         threshold=threshold,
-        top_k=top_k
     )
     
     # Print prediction statistics
@@ -376,12 +373,14 @@ def generate_submission(
         top_5_probs = sample_predictions[i][top_5]
         print(f"   Sample {i} top-5 classes: {top_5.tolist()}, probs: {top_5_probs}")
     
-    # Prepare level nodes cache for hierarchical selection
+    # Prepare level/structure caches for hierarchical selection & consistency
     global LEVEL_NODES_CACHE
     if use_hierarchical_top1 or use_hierarchical_confidence:
         LEVEL_NODES_CACHE = {}
         for node, level in hierarchy.levels.items():
             LEVEL_NODES_CACHE.setdefault(level, []).append(node)
+
+    leaves_set = set(hierarchy.get_leaves())
     
     # Convert predictions to label lists
     print("\nConverting predictions to submission format...")
@@ -391,7 +390,7 @@ def generate_submission(
     for i, pid in enumerate(tqdm(test_pids, desc="Formatting predictions")):
         probs = predictions[i]
         
-        # Apply selection strategy
+        # Apply base selection strategy (probability-based)
         if use_hierarchical_confidence:
             predicted_classes = select_hierarchical_confidence_path(
                 probs,
@@ -407,29 +406,70 @@ def generate_submission(
                 min_labels=min_labels,
                 max_labels=max_labels
             )
-        elif top_k is not None:
-            # Get top-k classes
-            top_k_indices = np.argsort(probs)[-top_k:][::-1]
-            predicted_classes = top_k_indices.tolist()
         else:
             # Threshold-based
             predicted_classes = np.where(probs >= threshold)[0].tolist()
         
-        # Ensure min/max labels constraint
-        if len(predicted_classes) < min_labels:
-            # If too few, add more top classes by probability
-            top_indices = np.argsort(probs)[-min_labels:][::-1]
-            predicted_classes = [int(idx) for idx in top_indices]
+        # ------------------------------------------------------------------
+        # Enforce taxonomy consistency + 2~3 label constraint
+        # ------------------------------------------------------------------
+        # 1) If any class is predicted, close it upward to its ancestors
+        if predicted_classes:
+            closure = set()
+            for cid in predicted_classes:
+                closure.add(int(cid))
+                for anc in hierarchy.get_ancestors(int(cid)):
+                    closure.add(int(anc))
+        else:
+            # Fallback: start from global best class
+            best = int(np.argmax(probs))
+            closure = set([best, *list(hierarchy.get_ancestors(best))])
+
+        closure = list(closure)
+
+        # 2) Pick a leaf-centric path (leaf + its parents) as main prediction
+        leaf_candidates = [c for c in closure if c in leaves_set]
+        if leaf_candidates:
+            best_leaf = max(leaf_candidates, key=lambda c: probs[c])
+        else:
+            best_leaf = max(closure, key=lambda c: probs[c])
+
+        path_nodes = list(hierarchy.get_ancestors(best_leaf)) + [best_leaf]
+        # sort path from root -> leaf
+        path_nodes = sorted(path_nodes, key=lambda c: hierarchy.get_level(c))
+
+        # 3) Enforce 2~3 labels using this path
+        if len(path_nodes) >= max_labels:
+            # take deepest max_labels nodes (closer to leaf)
+            selected = path_nodes[-max_labels:]
+        elif len(path_nodes) == 1:
+            selected = path_nodes[:]
+            # need at least 2 labels: add next best class not in path
+            extra_candidates = [c for c in closure if c not in selected]
+            if extra_candidates:
+                extra = max(extra_candidates, key=lambda c: probs[c])
+                selected.append(extra)
+        else:
+            # len(path_nodes) == 2 and max_labels == 3: keep as is (already >= min_labels)
+            selected = path_nodes[:]
+
+        # If still fewer than min_labels, pad with global top classes
+        if len(selected) < min_labels:
+            for idx in np.argsort(probs)[::-1]:
+                idx = int(idx)
+                if idx not in selected:
+                    selected.append(idx)
+                if len(selected) >= min_labels:
+                    break
+
+        # If more than max_labels (edge case), keep highest-prob classes
+        if max_labels is not None and len(selected) > max_labels:
+            selected = sorted(selected, key=lambda c: probs[c], reverse=True)[:max_labels]
+
+        predicted_classes = selected
         
-        if max_labels is not None and len(predicted_classes) > max_labels:
-            # If too many, keep top classes by probability
-            # Get probabilities for predicted classes and sort
-            class_probs = [(idx, probs[idx]) for idx in predicted_classes]
-            class_probs.sort(key=lambda x: x[1], reverse=True)
-            predicted_classes = [idx for idx, _ in class_probs[:max_labels]]
-        
-        # Sort class IDs
-        predicted_classes = sorted(predicted_classes)
+        # Sort class IDs for stable output
+        predicted_classes = sorted(set(int(c) for c in predicted_classes))
         
         all_pids.append(pid)
         all_labels.append(predicted_classes)
@@ -469,14 +509,10 @@ if __name__ == "__main__":
                         help="Output submission file path")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Probability threshold for predictions")
-    parser.add_argument("--top_k", type=int, default=None,
-                        help="Use top-k classes instead of threshold")
-    parser.add_argument("--min_labels", type=int, default=1,
+    parser.add_argument("--min_labels", type=int, default=2,
                         help="Minimum number of labels per sample")
-    parser.add_argument("--max_labels", type=int, default=None,
+    parser.add_argument("--max_labels", type=int, default=3,
                         help="Maximum number of labels per sample (no limit if not specified)")
-    parser.add_argument("--hier_top1", action="store_true",
-                        help="Use hierarchical top-1 selection (one class per level)")
     parser.add_argument("--hier_confidence", action="store_true",
                         help="Use confidence-based hierarchical path selection")
     parser.add_argument("--confidence_threshold", type=float, default=0.5,
@@ -489,10 +525,8 @@ if __name__ == "__main__":
         test_corpus_path=args.test_corpus,
         output_path=args.output,
         threshold=args.threshold,
-        top_k=args.top_k,
         min_labels=args.min_labels,
         max_labels=args.max_labels,
-        use_hierarchical_top1=args.hier_top1,
         use_hierarchical_confidence=args.hier_confidence,
         confidence_threshold=args.confidence_threshold
     )

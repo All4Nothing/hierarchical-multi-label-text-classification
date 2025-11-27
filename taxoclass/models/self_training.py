@@ -90,7 +90,7 @@ class SelfTrainer:
         if threshold is None:
             threshold = self.threshold
         
-        # Temperature scaling
+        """# Temperature scaling
         Q = torch.pow(predictions, 1.0 / temperature)
         
         # Apply threshold
@@ -104,7 +104,10 @@ class SelfTrainer:
         zero_rows = (Q_sum.squeeze() == 0)
         if zero_rows.any():
             # Keep original predictions for these samples
-            Q[zero_rows] = predictions[zero_rows]
+            Q[zero_rows] = predictions[zero_rows]"""
+        
+        # Hard Pseudo-labeling for convenience
+        Q = (predictions > threshold).float()
         
         return Q
     
@@ -179,6 +182,9 @@ class SelfTrainer:
             self.model.parameters(),
             lr=self.learning_rate
         )
+        # 기존: KL Divergence (Negative term 누락)
+        # 변경: BCEWithLogitsLoss (Soft Target 지원)
+        criterion = nn.BCEWithLogitsLoss(reduction='none')
         
         print(f"\nSelf-Training Iteration {iteration + 1}/{self.num_iterations}")
         
@@ -205,10 +211,12 @@ class SelfTrainer:
                 attention_mask = batch['attention_mask'].to(self.device)
                 
                 # Forward pass
-                predictions = self.model(input_ids, attention_mask, self.edge_index)
+                logits = self.model(input_ids, attention_mask, self.edge_index, return_probs=False)
                 
-                # Compute KL divergence loss
-                loss = self.kl_divergence_loss(predictions, batch_targets)
+                # Compute BCEWithLogitsLoss
+                # BCEWithLogitsLoss는 Target이 0과 1 사이의 실수여도 작동함 (Soft Label)
+                loss = criterion(logits, batch_targets)
+                loss = loss.mean()
                 
                 # Backward pass
                 optimizer.zero_grad()

@@ -141,13 +141,13 @@ def main():
     
     # Load training corpus
     print("\nLoading training corpus...")
-    train_corpus = DocumentCorpus(Config.TRAIN_CORPUS)
+    train_corpus = DocumentCorpus(Config.TRAIN_CORPUS, has_labels=False)
     train_documents = train_corpus.get_all_texts()
     train_labels = train_corpus.get_all_labels()
     
     # Load test corpus
     print("\nLoading test corpus...")
-    test_corpus = DocumentCorpus(Config.TEST_CORPUS)
+    test_corpus = DocumentCorpus(Config.TEST_CORPUS, has_labels=True)
     test_documents = test_corpus.get_all_texts()
     test_labels = test_corpus.get_all_labels()
     
@@ -444,8 +444,10 @@ def main():
     )
     model.class_embeddings.data = class_embeddings.to(device)
     
-    # Get edge index for GNN
-    edge_index = torch.LongTensor(hierarchy.get_edge_index())
+    # Get edge index for GNN (direction controlled by Config)
+    edge_index = torch.LongTensor(
+        hierarchy.get_edge_index(bidirectional=Config.GNN_BIDIRECTIONAL_EDGES)
+    )
     
     # Initialize trainer
     print("\nInitializing trainer...")

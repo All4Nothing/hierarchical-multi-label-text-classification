@@ -34,6 +34,8 @@ class Config:
     GNN_HIDDEN_DIM = 1024  # Scale up GNN hidden dim (512 -> 1024)
     GNN_NUM_LAYERS = 4  # Add one more GNN layer (3 -> 4)
     GNN_DROPOUT = 0.1
+    # Control GNN edge direction: True = bidirectional (parent<->child), False = top-down only (parent->child)
+    GNN_BIDIRECTIONAL_EDGES = False
     
     LEARNING_RATE = 1e-5  # Lower LR for larger model stability (2e-5 -> 1e-5)
     BATCH_SIZE = 16  # Reduced for memory efficiency (64 -> 16)
@@ -43,17 +45,18 @@ class Config:
     WEIGHT_DECAY = 0.01
     
     # Stage 4: Self-Training
-    SELF_TRAIN_ITERATIONS = 5
+    SELF_TRAIN_ITERATIONS = 3
     SELF_TRAIN_EPOCHS_PER_ITER = 3
-    SELF_TRAIN_TEMPERATURE = 2.0
-    SELF_TRAIN_THRESHOLD = 0.5
-    SELF_TRAIN_LR = 5e-6  # Lower LR for fine-tuning (1e-5 -> 5e-6)
-    
+    SELF_TRAIN_TEMPERATURE = 2.0 
+    SELF_TRAIN_THRESHOLD = 0.8 # Threshold를 높여서 확실한 것만 1로 만듦 (매우 중요)
+    SELF_TRAIN_LR = 1e-6 # LR을 매우 낮게 설정하여 파라미터가 튀지 않게 함
+     
     # Data Usage Strategy
     # Transductive learning: Use both train and test data (both are unlabeled)
     USE_TEST_IN_STAGE1 = True   # Zero-shot classification (safe, no label leakage)
     USE_TEST_IN_STAGE2 = True   # Core class mining (safe, confidence-based)
-    USE_TEST_IN_STAGE3 = False  # Initial training (conservative, train only)
+    # Stage 3 can optionally use high-confidence test pseudo-labels (transductive)
+    USE_TEST_IN_STAGE3 = True   # Initial training (now includes confident test data)
     USE_TEST_IN_STAGE4 = True   # Self-training (gradual, pseudo-label based)
     
     # Device

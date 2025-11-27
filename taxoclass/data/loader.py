@@ -11,7 +11,7 @@ import torch
 class DocumentCorpus:
     """Load and manage document corpus"""
     
-    def __init__(self, corpus_file: str):
+    def __init__(self, corpus_file: str, has_labels: bool = False):
         """
         Load corpus file
         
@@ -22,6 +22,7 @@ class DocumentCorpus:
         self.documents = []
         self.doc_ids = []
         self.labels = []  # Ground truth labels if available
+        self.has_labels = has_labels
         
         self._load_corpus()
     
@@ -31,12 +32,22 @@ class DocumentCorpus:
             for idx, line in enumerate(f):
                 parts = line.strip().split('\t', 1)
                 if len(parts) == 2:
-                    label = int(parts[0])
-                    text = parts[1]
+                    # has_labels 여부에 따라 다르게 처리
+                    if self.has_labels:
+                        # 정답이 있는 파일인 경우 (예: 검증셋 등)
+                        id_or_label = int(parts[0])
+                        text = parts[1]
+                        self.doc_ids.append(idx)
+                        self.labels.append(id_or_label)
+                    else:
+                        # 정답이 없는 학습용 코퍼스인 경우 (과제 데이터)
+                        doc_id = int(parts[0]) # 첫 컬럼은 문서 번호
+                        text = parts[1]
+                        self.doc_ids.append(doc_id)
+                        self.labels.append(-1) # 정답 없음(-1)으로 표시
                     
                     self.doc_ids.append(idx)
                     self.documents.append(text)
-                    self.labels.append(label)
         
         print(f"Loaded {len(self.documents)} documents from {self.corpus_file}")
     
@@ -152,14 +163,14 @@ def create_multi_label_matrix(
     """
     num_docs = len(doc_labels)
     
-    # Validate and adjust num_classes if needed
+    """# Validate and adjust num_classes if needed
     if core_class_assignments:
         max_core_class = max(core_class_assignments.values())
         if max_core_class >= num_classes:
             actual_num_classes = max_core_class + 1
             print(f"⚠️  Warning: Max core class ID ({max_core_class}) >= num_classes ({num_classes})")
             print(f"   Adjusting num_classes to {actual_num_classes}")
-            num_classes = actual_num_classes
+            num_classes = actual_num_classes"""
     
     label_matrix = np.zeros((num_docs, num_classes), dtype=np.float32)
     
@@ -218,43 +229,36 @@ def create_ground_truth_matrix(
     num_docs = len(doc_labels)
     
     # Check if class IDs are within valid range
+    # num_classes는 hierarchy에서 가져온 고정값이어야 함
+# 범위를 벗어나는 라벨이 있어도 num_classes를 늘리지 않고, 해당 라벨을 무시함
+
     if doc_labels:
-        max_class_id = max(doc_labels)
-        min_class_id = min(doc_labels)
+        max_label = max(doc_labels)
+        min_label = min(doc_labels)
         
-        # Adjust num_classes if needed (handle 0-based vs 1-based indexing)
-        if max_class_id >= num_classes:
-            # If max_class_id is 531 and num_classes is 531, we need 532 (0-531)
-            # Or if class IDs are 1-based (1-531), we need to adjust
-            actual_num_classes = max_class_id + 1
-            print(f"⚠️  Warning: Max class ID ({max_class_id}) >= num_classes ({num_classes})")
-            print(f"   Adjusting num_classes to {actual_num_classes}")
-            num_classes = actual_num_classes
-        elif min_class_id < 0:
-            print(f"⚠️  Warning: Min class ID ({min_class_id}) < 0, adjusting...")
-            # Shift all IDs to be non-negative
-            shift = -min_class_id
-            doc_labels = [label + shift for label in doc_labels]
-            num_classes += shift
-            print(f"   Shifted class IDs by {shift}, new num_classes: {num_classes}")
+        # 디버깅용 경고 출력 (필요시 주석 처리)
+        if max_label >= num_classes:
+            print(f"⚠️  Warning: Found label ID {max_label} >= num_classes ({num_classes}). This label will be IGNORED.")
+        if min_label < 0:
+            print(f"⚠️  Warning: Found negative label ID {min_label}. This label will be IGNORED.")
     
     gt_matrix = np.zeros((num_docs, num_classes), dtype=np.int32)
     
+    # 실제 행렬 생성 루프
     for doc_id, label_class in enumerate(doc_labels):
-        # Validate class ID is within bounds
-        if label_class < 0 or label_class >= num_classes:
-            print(f"⚠️  Warning: Document {doc_id} has invalid class ID {label_class} (valid range: 0-{num_classes-1}), skipping...")
+        # [핵심] 유효 범위(0 ~ num_classes-1) 내의 라벨만 1로 표시
+        if 0 <= label_class < num_classes:
+            # label_class와 그 조상들을 1로 설정
+            gt_matrix[doc_id, label_class] = 1
+            try:
+                for ancestor in hierarchy.get_ancestors(label_class):
+                    if 0 <= ancestor < num_classes: # 조상 ID도 유효한지 체크
+                        gt_matrix[doc_id, ancestor] = 1
+            except (KeyError, AttributeError):
+                pass
+        else:
+            # 범위를 벗어난 라벨은 조용히 무시 (Skip)
             continue
-        
-        # Mark the label and all its ancestors as positive
-        gt_matrix[doc_id, label_class] = 1
-        try:
-            for ancestor in hierarchy.get_ancestors(label_class):
-                if 0 <= ancestor < num_classes:
-                    gt_matrix[doc_id, ancestor] = 1
-        except (KeyError, AttributeError):
-            # If class ID not in hierarchy, skip ancestors
-            pass
     
     return gt_matrix
 

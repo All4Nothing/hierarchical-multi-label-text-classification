@@ -40,7 +40,9 @@ def example_prediction():
     tokenizer = BertTokenizer.from_pretrained(Config.DOC_ENCODER_MODEL)
     
     # Get edge index
-    edge_index = torch.LongTensor(hierarchy.get_edge_index()).to(Config.DEVICE)
+    edge_index = torch.LongTensor(
+        hierarchy.get_edge_index(bidirectional=Config.GNN_BIDIRECTIONAL_EDGES)
+    ).to(Config.DEVICE)
     
     # Example documents
     documents = [

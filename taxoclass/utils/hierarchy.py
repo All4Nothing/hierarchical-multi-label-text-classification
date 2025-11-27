@@ -186,15 +186,18 @@ class TaxonomyHierarchy:
         """Get depth level of class"""
         return self.levels.get(class_id, -1)
     
-    def get_edge_index(self) -> np.ndarray:
+    def get_edge_index(self, bidirectional: bool = False) -> np.ndarray:
         """
         Get edge index for PyTorch Geometric
         Returns: (2, num_edges) array
         """
         edges = []
         for parent, child in self.graph.edges():
+            # Parent -> Child is the natural (top-down) hierarchy direction
             edges.append([parent, child])
-            edges.append([child, parent])  # Bidirectional
+            if bidirectional:
+                # Optionally add Child -> Parent edges for bidirectional message passing
+                edges.append([child, parent])
         
         if len(edges) == 0:
             return np.array([[], []], dtype=np.int64)
