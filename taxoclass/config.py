@@ -24,8 +24,8 @@ class Config:
     HYPOTHESIS_TEMPLATE = "This document is about {class_name}"
     
     # Stage 2: Core Class Mining
-    CANDIDATE_SELECTION_POWER = 2  # (level+1)^2
-    CONFIDENCE_THRESHOLD_PERCENTILE = 50  # Median
+    CANDIDATE_SELECTION_POWER = 4  # (level+1)^2
+    CONFIDENCE_THRESHOLD_PERCENTILE = 40  # Median
     
     # Stage 3: Classifier Training
     DOC_ENCODER_MODEL = "bert-large-uncased"  # Upgrade to bert-large for A6000

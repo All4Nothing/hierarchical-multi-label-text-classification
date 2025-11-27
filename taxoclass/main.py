@@ -147,7 +147,7 @@ def main():
     
     # Load test corpus
     print("\nLoading test corpus...")
-    test_corpus = DocumentCorpus(Config.TEST_CORPUS, has_labels=True)
+    test_corpus = DocumentCorpus(Config.TEST_CORPUS, has_labels=False)
     test_documents = test_corpus.get_all_texts()
     test_labels = test_corpus.get_all_labels()
     
