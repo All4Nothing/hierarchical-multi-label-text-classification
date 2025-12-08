@@ -20,89 +20,6 @@ from models.classifier import (
     initialize_class_embeddings_with_bert
 )
 
-# Cache for level nodes to avoid recomputation
-LEVEL_NODES_CACHE = None
-
-
-def select_hierarchical_top1(
-    probs: np.ndarray,
-    level_nodes_cache: dict,
-    min_labels: int = 1,
-    max_labels: int = None
-) -> List[int]:
-    """Select one class per level based on highest probability."""
-    selected = []
-    if not level_nodes_cache:
-        return selected
-    
-    for level in sorted(level_nodes_cache.keys()):
-        nodes = level_nodes_cache[level]
-        if not nodes:
-            continue
-        best_node = max(nodes, key=lambda n: probs[n])
-        if best_node not in selected:
-            selected.append(best_node)
-        if max_labels is not None and len(selected) >= max_labels:
-            break
-    
-    if len(selected) < min_labels:
-        sorted_indices = np.argsort(probs)[::-1]
-        for idx in sorted_indices:
-            if idx not in selected:
-                selected.append(int(idx))
-            if len(selected) >= min_labels:
-                break
-    return selected
-
-def select_hierarchical_confidence_path(
-    probs: np.ndarray,
-    level_nodes_cache: dict,
-    hierarchy: TaxonomyHierarchy,  # Hierarchy 객체 필요
-    confidence_threshold: float = 0.5,
-    min_labels: int = 1,
-    max_labels: int = None
-) -> List[int]:
-    """
-    Greedy search from Root to Leaf respecting parent-child constraints.
-    """
-    selected = []
-    
-    # 1. Level 0 (Root) 선택
-    roots = hierarchy.get_roots()
-    if not roots:
-        return []
-        
-    # Root 중 최고 확률 선택
-    best_node = max(roots, key=lambda n: probs[n])
-    selected.append(best_node)
-    
-    # 2. Top-down 탐색 (자식 노드로 이동)
-    current_node = best_node
-    
-    while True:
-        # 현재 노드의 자식들 가져오기
-        children = hierarchy.get_children(current_node)
-        if not children:
-            break  # Leaf 노드 도달
-            
-        # 자식 중 최고 확률 선택
-        best_child = max(children, key=lambda n: probs[n])
-        best_prob = probs[best_child]
-        
-        # Threshold 체크
-        if best_prob >= confidence_threshold:
-            selected.append(best_child)
-            current_node = best_child
-        else:
-            break # 확신 없으면 여기서 멈춤 (Stop)
-            
-        # Max labels 체크
-        if max_labels is not None and len(selected) >= max_labels:
-            break
-            
-    # Min labels 보정 (부족하면 확률 높은 순으로 채우기 - post processing에서 처리되므로 여기선 패스 가능)
-    return selected
-
 
 
 def select_pure_threshold(
@@ -352,10 +269,6 @@ def generate_submission(
     threshold: float = 0.5,
     min_labels: int = 2,
     max_labels: int = 3,  # Kaggle rule: at least 2 and at most 3 labels
-    use_hierarchical_top1: bool = False,
-    use_hierarchical_confidence: bool = False,
-    confidence_threshold: float = 0.5,
-    pure_threshold: bool = False
 ):
     """
     Generate submission file for Kaggle competition
@@ -367,15 +280,10 @@ def generate_submission(
         threshold: Probability threshold for predictions
         min_labels: Minimum number of labels per sample
         max_labels: Maximum number of labels per sample
-        use_hierarchical_top1: Use hierarchical top-1 selection
-        use_hierarchical_confidence: Use hierarchical confidence path selection
-        confidence_threshold: Confidence threshold for hierarchical path
-        pure_threshold: Use pure threshold + ancestor closure (paper method)
     """
     print("="*80)
     print(" "*25 + "GENERATE SUBMISSION FILE")
     print("="*80)
-    print(f"use_hierarchical_confidence: {use_hierarchical_confidence}, use_hierarchical_top1: {use_hierarchical_top1}")
     # Set device
     device = Config.DEVICE
     if device == "cuda" and not torch.cuda.is_available():
@@ -421,9 +329,9 @@ def generate_submission(
     print(f"Loaded {len(test_documents)} test documents")
     
     """for debugging"""
-    max_samples = 200
+    """max_samples = 200
     test_pids = test_pids[:max_samples]
-    test_documents = test_documents[:max_samples]
+    test_documents = test_documents[:max_samples]"""
 
     # Create dataset and loader
     print("\nCreating test dataset...")
@@ -489,27 +397,14 @@ def generate_submission(
         top_5_probs = sample_predictions[i][top_5]
         print(f"   Sample {i} top-5 classes: {top_5.tolist()}, probs: {top_5_probs}")
     
-    # Prepare level/structure caches for hierarchical selection & consistency
-    global LEVEL_NODES_CACHE
-    if use_hierarchical_top1 or use_hierarchical_confidence:
-        LEVEL_NODES_CACHE = {}
-        for node, level in hierarchy.levels.items():
-            LEVEL_NODES_CACHE.setdefault(level, []).append(node)
-
     leaves_set = set(hierarchy.get_leaves())
     
     # Convert predictions to label lists
     print("\nConverting predictions to submission format...")
     
-    # Print selected method
-    if pure_threshold:
-        print("📊 Using: Pure Threshold + Ancestor Closure (Paper Method)")
-    elif use_hierarchical_confidence:
-        print("📊 Using: Hierarchical Confidence Path")
-    elif use_hierarchical_top1:
-        print("📊 Using: Hierarchical Top-1")
-    else:
-        print("📊 Using: Threshold + Leaf-centric Post-processing (Default)")
+
+    print("📊 Using: Pure Threshold + Ancestor Closure")
+
     
     all_pids = []
     all_labels = []
@@ -517,106 +412,16 @@ def generate_submission(
     for i, pid in enumerate(tqdm(test_pids, desc="Formatting predictions")):
         probs = predictions[i]
         
-        # Apply selection strategy based on method
-        if pure_threshold:
-            # Pure threshold method (paper method)
-            predicted_classes = select_pure_threshold(
-                probs,
-                hierarchy=hierarchy,
-                threshold=threshold,
-                min_labels=min_labels,
-                max_labels=max_labels
-            )
+        predicted_classes = select_pure_threshold(
+            probs,
+            hierarchy=hierarchy,
+            threshold=threshold,
+            min_labels=min_labels,
+            max_labels=max_labels
+        )
 
-            all_pids.append(pid)
-            all_labels.append(sorted(predicted_classes))
-            continue
-        
-        # Other methods (with post-processing)
-        elif use_hierarchical_confidence:
-            # print(f"use_hierarchical_confidence: {use_hierarchical_confidence}")
-            predicted_classes = select_hierarchical_confidence_path(
-                probs,
-                hierarchy=hierarchy,
-                level_nodes_cache=LEVEL_NODES_CACHE,
-                confidence_threshold=confidence_threshold,
-                min_labels=min_labels,
-                max_labels=max_labels
-            )
-        elif use_hierarchical_top1:
-            predicted_classes = select_hierarchical_top1(
-                probs,
-                level_nodes_cache=LEVEL_NODES_CACHE,
-                min_labels=min_labels,
-                max_labels=max_labels
-            )
-        else:
-            # Threshold-based
-            predicted_classes = np.where(probs >= threshold)[0].tolist()
-        
-        # ------------------------------------------------------------------
-        # Enforce taxonomy consistency + 2~3 label constraint
-        # ------------------------------------------------------------------
-        # 1) If any class is predicted, close it upward to its ancestors
-        if predicted_classes:
-            closure = set()
-            for cid in predicted_classes:
-                closure.add(int(cid))
-                for anc in hierarchy.get_ancestors(int(cid)):
-                    closure.add(int(anc))
-        else:
-            # Fallback: start from global best class
-            best = int(np.argmax(probs))
-            closure = set([best, *list(hierarchy.get_ancestors(best))])
-
-        closure = list(closure)
-
-        # 2) Pick a leaf-centric path (leaf + its parents) as main prediction
-        leaf_candidates = [c for c in closure if c in leaves_set]
-        if leaf_candidates:
-            best_leaf = max(leaf_candidates, key=lambda c: probs[c])
-        else:
-            best_leaf = max(closure, key=lambda c: probs[c])
-
-        path_nodes = list(hierarchy.get_ancestors(best_leaf)) + [best_leaf]
-        # sort path from root -> leaf
-        path_nodes = sorted(path_nodes, key=lambda c: hierarchy.get_level(c))
-
-        # 3) Enforce 2~3 labels using this path
-        if len(path_nodes) >= max_labels:
-            # take deepest max_labels nodes (closer to leaf)
-            selected = path_nodes[-max_labels:]
-        elif len(path_nodes) == 1:
-            selected = path_nodes[:]
-            # need at least 2 labels: add next best class not in path
-            extra_candidates = [c for c in closure if c not in selected]
-            if extra_candidates:
-                extra = max(extra_candidates, key=lambda c: probs[c])
-                selected.append(extra)
-        else:
-            # len(path_nodes) == 2 and max_labels == 3: keep as is (already >= min_labels)
-            selected = path_nodes[:]
-
-        # If still fewer than min_labels, pad with global top classes
-        if len(selected) < min_labels:
-            for idx in np.argsort(probs)[::-1]:
-                idx = int(idx)
-                if idx not in selected:
-                    selected.append(idx)
-                if len(selected) >= min_labels:
-                    break
-
-        # If more than max_labels (edge case), keep highest-prob classes
-        if max_labels is not None and len(selected) > max_labels:
-            selected = sorted(selected, key=lambda c: probs[c], reverse=True)[:max_labels]
-
-        predicted_classes = selected
-        
-        # Sort class IDs for stable output
-        predicted_classes = sorted(set(int(c) for c in predicted_classes))
-        
         all_pids.append(pid)
-        all_labels.append(predicted_classes)
+        all_labels.append(sorted(predicted_classes))
     
     # Save submission file
     print(f"\nSaving submission file to {output_path}...")
@@ -657,15 +462,7 @@ if __name__ == "__main__":
                         help="Minimum number of labels per sample")
     parser.add_argument("--max_labels", type=int, default=3,
                         help="Maximum number of labels per sample (no limit if not specified)")
-    parser.add_argument("--hier_confidence", action="store_true",
-                        help="Use confidence-based hierarchical path selection")
-    parser.add_argument("--confidence_threshold", type=float, default=0.5,
-                        help="Confidence threshold for hierarchical path expansion")
-    parser.add_argument("--hier_top1", action="store_true",
-                        help="Use top-1 hierarchical selection")
-    parser.add_argument("--pure_threshold", action="store_true",
-                        help="Use pure threshold + ancestor closure method (paper method, no post-processing)")
-    
+
     args = parser.parse_args()
     
     generate_submission(
@@ -675,9 +472,5 @@ if __name__ == "__main__":
         threshold=args.threshold,
         min_labels=args.min_labels,
         max_labels=args.max_labels,
-        use_hierarchical_confidence=args.hier_confidence,
-        confidence_threshold=args.confidence_threshold,
-        use_hierarchical_top1=args.hier_top1,
-        pure_threshold=args.pure_threshold
     )
 

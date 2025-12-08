@@ -19,7 +19,7 @@ ValueError: edge_index must be provided either as argument or registered buffer
 
 ```python
 # main.py Line ~425
-model.register_buffer('edge_index', edge_index)
+model.register_buffer('edge_index', edge_index)ㅇ
 model = model.to(main_device)
 # DataParallel 래핑은 SelfTrainer에서 처리
 ```
