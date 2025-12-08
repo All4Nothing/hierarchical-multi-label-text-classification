@@ -20,7 +20,8 @@ class DocumentClassSimilarity:
         device: str = "cuda",
         batch_size: int = 16,
         max_length: int = 256,
-        cache_dir: str = "./cache"
+        cache_dir: str = "./cache",
+        use_multi_gpu: bool = False
     ):
         """
         Initialize similarity calculator
@@ -32,6 +33,7 @@ class DocumentClassSimilarity:
             batch_size: Batch size for inference
             max_length: Maximum sequence length
             cache_dir: Directory to cache results
+            use_multi_gpu: Whether to use DataParallel for multi-GPU inference
         """
         self.model_name = model_name
         self.hypothesis_template = hypothesis_template
@@ -45,6 +47,12 @@ class DocumentClassSimilarity:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
         self.model.to(device)
+        
+        # Wrap model with DataParallel if multiple GPUs are available
+        if use_multi_gpu and torch.cuda.device_count() > 1:
+            self.model = torch.nn.DataParallel(self.model)
+            print(f"✅ Using DataParallel on {torch.cuda.device_count()} GPUs for similarity calculation")
+        
         self.model.eval()
         
         print(f"Model loaded on {device}")

@@ -36,8 +36,8 @@ class CoreClassMiner:
         
         # Store candidates and core classes
         self.candidate_classes = {}  # doc_id -> set of candidate classes
-        self.core_classes = {}  # doc_id -> core class id
-        self.confidence_scores = {}  # doc_id -> confidence score
+        self.core_classes = {}  # doc_id -> list of core class ids (multi-label)
+        self.confidence_scores = {}  # doc_id -> dict of {class_id: confidence_score}
         
         print(f"Initialized CoreClassMiner for {self.num_docs} docs and {self.num_classes} classes")
     
@@ -150,12 +150,15 @@ class CoreClassMiner:
         
         return thresholds
     
-    def identify_core_classes(self) -> Dict[int, int]:
+    def identify_core_classes(self) -> Dict[int, List[int]]:
         """
-        Identify core class for each document
+        Identify core classes for each document (multi-label)
+        
+        Paper: A class is a core class if its confidence score exceeds the threshold.
+        Multiple classes can be core classes for one document.
         
         Returns:
-            Dictionary mapping doc_id to core_class_id
+            Dictionary mapping doc_id to list of core_class_ids
         """
         print("Step 1: Selecting candidate classes using top-down search...")
         for doc_id in tqdm(range(self.num_docs)):
@@ -165,55 +168,73 @@ class CoreClassMiner:
         print("Step 2: Computing confidence thresholds...")
         thresholds = self.compute_confidence_thresholds()
         
-        print("Step 3: Identifying core classes...")
+        print("Step 3: Identifying core classes (multi-label)...")
         for doc_id in tqdm(range(self.num_docs)):
             candidates = self.candidate_classes[doc_id]
             
             # Compute confidence scores for all candidates
-            candidate_scores = []
+            doc_core_classes = []
+            doc_confidence_scores = {}
+            
             for class_id in candidates:
                 conf_score = self.compute_confidence_score(doc_id, class_id)
                 threshold = thresholds.get(class_id, 0.0)
                 
                 # Check if confidence exceeds threshold
+                # All classes that exceed threshold are core classes (multi-label)
                 if conf_score >= threshold:
-                    candidate_scores.append((class_id, conf_score))
+                    doc_core_classes.append(class_id)
+                    doc_confidence_scores[class_id] = conf_score
             
-            # Select class with highest confidence as core class
-            if candidate_scores:
-                candidate_scores.sort(key=lambda x: x[1], reverse=True)
-                core_class, core_conf = candidate_scores[0]
-                
-                self.core_classes[doc_id] = core_class
-                self.confidence_scores[doc_id] = core_conf
+            # Store multiple core classes
+            if doc_core_classes:
+                self.core_classes[doc_id] = doc_core_classes
+                self.confidence_scores[doc_id] = doc_confidence_scores
             else:
                 # Fallback: select class with highest similarity among candidates
                 if candidates:
                     doc_similarities = self.similarity_matrix[doc_id]
                     best_class = max(candidates, key=lambda c: doc_similarities[c])
-                    self.core_classes[doc_id] = best_class
-                    self.confidence_scores[doc_id] = doc_similarities[best_class]
+                    self.core_classes[doc_id] = [best_class]  # Still a list
+                    self.confidence_scores[doc_id] = {best_class: doc_similarities[best_class]}
         
+        total_core_classes = sum(len(cores) for cores in self.core_classes.values())
+        avg_core_classes = total_core_classes / len(self.core_classes) if self.core_classes else 0
         print(f"Identified core classes for {len(self.core_classes)} documents")
+        print(f"Total core classes: {total_core_classes}, Avg per doc: {avg_core_classes:.2f}")
         
         return self.core_classes
     
-    def get_core_class(self, doc_id: int) -> int:
-        """Get core class for a document"""
-        return self.core_classes.get(doc_id, -1)
+    def get_core_classes(self, doc_id: int) -> List[int]:
+        """Get core classes for a document (returns list)"""
+        return self.core_classes.get(doc_id, [])
     
-    def get_confidence_score(self, doc_id: int) -> float:
-        """Get confidence score for a document"""
-        return self.confidence_scores.get(doc_id, 0.0)
+    def get_confidence_scores(self, doc_id: int) -> Dict[int, float]:
+        """Get confidence scores for a document (returns dict of {class_id: score})"""
+        return self.confidence_scores.get(doc_id, {})
     
     def get_statistics(self) -> Dict[str, float]:
         """Get statistics about core class mining"""
+        # Collect all confidence scores across all documents and classes
+        all_conf_scores = []
+        for doc_scores in self.confidence_scores.values():
+            if isinstance(doc_scores, dict):
+                all_conf_scores.extend(doc_scores.values())
+            else:
+                # Fallback for old single-value format
+                all_conf_scores.append(doc_scores)
+        
+        total_core_classes = sum(len(cores) for cores in self.core_classes.values())
+        avg_core_classes_per_doc = total_core_classes / len(self.core_classes) if self.core_classes else 0
+        
         stats = {
             'num_docs_with_core_class': len(self.core_classes),
+            'total_core_classes': total_core_classes,
+            'avg_core_classes_per_doc': avg_core_classes_per_doc,
             'avg_candidates_per_doc': np.mean([len(candidates) for candidates in self.candidate_classes.values()]),
-            'avg_confidence_score': np.mean(list(self.confidence_scores.values())),
-            'min_confidence_score': np.min(list(self.confidence_scores.values())) if self.confidence_scores else 0.0,
-            'max_confidence_score': np.max(list(self.confidence_scores.values())) if self.confidence_scores else 0.0
+            'avg_confidence_score': np.mean(all_conf_scores) if all_conf_scores else 0.0,
+            'min_confidence_score': np.min(all_conf_scores) if all_conf_scores else 0.0,
+            'max_confidence_score': np.max(all_conf_scores) if all_conf_scores else 0.0
         }
         
         return stats
@@ -226,12 +247,14 @@ class CoreClassMiner:
             Dictionary mapping class_id to count of documents
         """
         distribution = defaultdict(int)
-        for doc_id, core_class in self.core_classes.items():
-            distribution[core_class] += 1
+        for doc_id, core_classes in self.core_classes.items():
+            # core_classes is now a list
+            for core_class in core_classes:
+                distribution[core_class] += 1
         
         return dict(distribution)
     
-    def filter_low_confidence_docs(self, min_confidence: float = 0.0) -> Dict[int, int]:
+    def filter_low_confidence_docs(self, min_confidence: float = 0.0) -> Dict[int, List[int]]:
         """
         Filter documents with low confidence scores
         
@@ -242,13 +265,112 @@ class CoreClassMiner:
             Filtered core_classes dictionary
         """
         filtered = {}
-        for doc_id, core_class in self.core_classes.items():
-            if self.confidence_scores[doc_id] >= min_confidence:
-                filtered[doc_id] = core_class
+        for doc_id, core_classes in self.core_classes.items():
+            # Filter core classes by confidence
+            filtered_classes = []
+            doc_scores = self.confidence_scores[doc_id]
+            
+            for class_id in core_classes:
+                if isinstance(doc_scores, dict):
+                    score = doc_scores.get(class_id, 0.0)
+                else:
+                    # Fallback for old single-value format
+                    score = doc_scores
+                
+                if score >= min_confidence:
+                    filtered_classes.append(class_id)
+            
+            if filtered_classes:
+                filtered[doc_id] = filtered_classes
         
         print(f"Filtered {len(filtered)}/{len(self.core_classes)} documents with confidence >= {min_confidence}")
         
         return filtered
+
+
+def create_training_labels(
+    core_classes_dict: Dict[int, List[int]],
+    hierarchy,
+    num_classes: int,
+    num_docs: int = None
+) -> np.ndarray:
+    """
+    Create training labels from core classes for Stage 3 classifier training
+    
+    Paper: 
+    - Positive set: Core classes + their ancestors (parents)
+    - Negative set: All other classes except descendants of core classes
+    - Ignore set (-1): Descendants of core classes (children)
+    
+    Args:
+        core_classes_dict: Dictionary mapping doc_id to list of core_class_ids
+        hierarchy: TaxonomyHierarchy object
+        num_classes: Total number of classes
+        num_docs: Total number of documents (if None, uses max(doc_id) + 1)
+    
+    Returns:
+        Label matrix (num_docs, num_classes) where:
+            1 = positive (core class or ancestor)
+            0 = negative (other classes)
+           -1 = ignore (descendants of core classes)
+    """
+    # Determine number of documents
+    if num_docs is None:
+        if core_classes_dict:
+            num_docs = max(core_classes_dict.keys()) + 1
+        else:
+            num_docs = 0
+    
+    labels = np.zeros((num_docs, num_classes), dtype=np.float32)
+    
+    print("Creating training labels from core classes...")
+    for doc_id in tqdm(range(num_docs)):
+        if doc_id not in core_classes_dict:
+            # Documents without core classes get all zeros (all negative)
+            continue
+        
+        core_classes = core_classes_dict[doc_id]
+        
+        positive_set = set()
+        ignore_set = set()
+        
+        for core_class in core_classes:
+            # Add core class to positive set
+            positive_set.add(core_class)
+            
+            # Add all ancestors to positive set
+            ancestors = hierarchy.get_ancestors(core_class)
+            positive_set.update(ancestors)
+            
+            # Add all descendants to ignore set
+            descendants = hierarchy.get_descendants(core_class)
+            ignore_set.update(descendants)
+        
+        # Remove overlap: positive set takes precedence over ignore set
+        ignore_set = ignore_set - positive_set
+        
+        # Set labels
+        for class_id in positive_set:
+            labels[doc_id, class_id] = 1.0
+        
+        for class_id in ignore_set:
+            labels[doc_id, class_id] = -1.0
+        
+        # All other classes remain 0 (negative)
+    
+    # Print statistics
+    num_positive = (labels == 1).sum()
+    num_negative = (labels == 0).sum()
+    num_ignore = (labels == -1).sum()
+    total = labels.size
+    
+    print(f"\nLabel Statistics:")
+    print(f"  Positive: {num_positive} ({100*num_positive/total:.2f}%)")
+    print(f"  Negative: {num_negative} ({100*num_negative/total:.2f}%)")
+    print(f"  Ignore: {num_ignore} ({100*num_ignore/total:.2f}%)")
+    print(f"  Avg positive per doc: {num_positive/num_docs:.2f}")
+    
+    return labels
 
 
 class CoreClassAnalyzer:
@@ -274,9 +396,11 @@ class CoreClassAnalyzer:
         """
         level_dist = defaultdict(int)
         
-        for doc_id, core_class in self.core_miner.core_classes.items():
-            level = self.hierarchy.get_level(core_class)
-            level_dist[level] += 1
+        for doc_id, core_classes in self.core_miner.core_classes.items():
+            # core_classes is now a list
+            for core_class in core_classes:
+                level = self.hierarchy.get_level(core_class)
+                level_dist[level] += 1
         
         return dict(sorted(level_dist.items()))
     
@@ -311,6 +435,8 @@ class CoreClassAnalyzer:
         print("Core Class Mining Summary")
         print("="*60)
         print(f"Documents with core class: {stats['num_docs_with_core_class']}")
+        print(f"Total core classes: {stats['total_core_classes']}")
+        print(f"Avg core classes per doc: {stats['avg_core_classes_per_doc']:.2f}")
         print(f"Avg candidates per doc: {stats['avg_candidates_per_doc']:.2f}")
         print(f"Avg confidence score: {stats['avg_confidence_score']:.4f}")
         print(f"Min confidence score: {stats['min_confidence_score']:.4f}")
@@ -319,7 +445,7 @@ class CoreClassAnalyzer:
         print("\nLevel Distribution:")
         level_dist = self.get_level_distribution()
         for level, count in level_dist.items():
-            print(f"  Level {level}: {count} documents")
+            print(f"  Level {level}: {count} core class assignments")
         
         print("\nTop-10 Core Classes:")
         top_classes = self.get_top_core_classes(10)

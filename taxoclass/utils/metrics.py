@@ -296,17 +296,33 @@ def evaluate_model(
     Returns:
         Dictionary of metrics
     """
+    # Get actual model (unwrap DataParallel if needed)
+    actual_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    
+    # Register edge_index as buffer in the actual model (DataParallel-safe)
+    if not hasattr(actual_model, 'edge_index') or actual_model.edge_index is None:
+        actual_model.register_buffer('edge_index', edge_index.to(device), persistent=False)
+    else:
+        actual_model.edge_index.data = edge_index.to(device)
+    
     model.eval()
     all_predictions = []
     
     print("Generating predictions...")
+    # Set return_probs to True for inference (on actual model, not wrapper)
+    actual_model.set_return_probs(True)
+    
     with torch.no_grad():
         for batch in test_loader:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             
-            predictions = model(input_ids, attention_mask, edge_index, return_probs=True)
+            # edge_index is stored as model buffer
+            predictions = model(input_ids, attention_mask)
             all_predictions.append(predictions.cpu().numpy())
+    
+    # Reset return_probs to False (on actual model, not wrapper)
+    actual_model.set_return_probs(False)
     
     predictions = np.vstack(all_predictions)
     
@@ -350,6 +366,18 @@ def predict_top_k_classes(
     Returns:
         List of [(class_id, class_name, score)] for each document
     """
+    # Get actual model (unwrap DataParallel if needed)
+    actual_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    
+    # Register edge_index as buffer in the actual model (DataParallel-safe)
+    if not hasattr(actual_model, 'edge_index') or actual_model.edge_index is None:
+        actual_model.register_buffer('edge_index', edge_index.to(device), persistent=False)
+    else:
+        actual_model.edge_index.data = edge_index.to(device)
+    
+    # Set return_probs to True for inference (on actual model, not wrapper)
+    actual_model.set_return_probs(True)
+    
     model.eval()
     results = []
     
@@ -369,8 +397,11 @@ def predict_top_k_classes(
             input_ids = encodings['input_ids'].to(device)
             attention_mask = encodings['attention_mask'].to(device)
             
-            # Predict (return probabilities for inference)
-            predictions = model(input_ids, attention_mask, edge_index, return_probs=True)
+            # Predict (return probabilities for inference, edge_index is stored as model buffer)
+            predictions = model(input_ids, attention_mask)
+    
+            # Reset return_probs to False (on actual model, not wrapper)
+            actual_model.set_return_probs(False)
             predictions = predictions.cpu().numpy()
             
             # Get top-k for each document

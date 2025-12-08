@@ -54,45 +54,117 @@ def select_hierarchical_top1(
                 break
     return selected
 
-
 def select_hierarchical_confidence_path(
     probs: np.ndarray,
     level_nodes_cache: dict,
+    hierarchy: TaxonomyHierarchy,  # Hierarchy 객체 필요
     confidence_threshold: float = 0.5,
     min_labels: int = 1,
     max_labels: int = None
 ) -> List[int]:
     """
-    Select classes along a single hierarchy path, expanding level-by-level
-    only if the best class at the next level exceeds confidence_threshold.
+    Greedy search from Root to Leaf respecting parent-child constraints.
     """
     selected = []
-    if not level_nodes_cache:
-        return selected
     
-    for level in sorted(level_nodes_cache.keys()):
-        nodes = level_nodes_cache[level]
-        if not nodes:
-            continue
-        best_node = max(nodes, key=lambda n: probs[n])
-        best_prob = probs[best_node]
+    # 1. Level 0 (Root) 선택
+    roots = hierarchy.get_roots()
+    if not roots:
+        return []
         
-        if level == 0 or best_prob >= confidence_threshold:
-            if best_node not in selected:
-                selected.append(best_node)
+    # Root 중 최고 확률 선택
+    best_node = max(roots, key=lambda n: probs[n])
+    selected.append(best_node)
+    
+    # 2. Top-down 탐색 (자식 노드로 이동)
+    current_node = best_node
+    
+    while True:
+        # 현재 노드의 자식들 가져오기
+        children = hierarchy.get_children(current_node)
+        if not children:
+            break  # Leaf 노드 도달
+            
+        # 자식 중 최고 확률 선택
+        best_child = max(children, key=lambda n: probs[n])
+        best_prob = probs[best_child]
+        
+        # Threshold 체크
+        if best_prob >= confidence_threshold:
+            selected.append(best_child)
+            current_node = best_child
         else:
-            break
-        
+            break # 확신 없으면 여기서 멈춤 (Stop)
+            
+        # Max labels 체크
         if max_labels is not None and len(selected) >= max_labels:
             break
+            
+    # Min labels 보정 (부족하면 확률 높은 순으로 채우기 - post processing에서 처리되므로 여기선 패스 가능)
+    return selected
+
+
+
+def select_pure_threshold(
+    probs: np.ndarray,
+    hierarchy,
+    threshold: float = 0.5,
+    min_labels: int = 2,
+    max_labels: int = 3
+) -> List[int]:
+    """
+    Pure threshold + ancestor closure method (paper method)
     
+    This method follows the TaxoClass paper more closely:
+    1. Select all classes above threshold
+    2. Add ancestors for hierarchical consistency
+    3. Select top-K by probability
+    
+    Args:
+        probs: Class probabilities
+        hierarchy: TaxonomyHierarchy object
+        threshold: Probability threshold
+        min_labels: Minimum number of labels
+        max_labels: Maximum number of labels
+    
+    Returns:
+        Selected class indices
+    """
+    # Step 1: Threshold-based selection
+    predicted = np.where(probs >= threshold)[0].tolist()
+    
+    if not predicted:
+        # Fallback: select top class
+        predicted = [int(np.argmax(probs))]
+    
+    # Step 2: Add ancestors for hierarchical consistency
+    closure = set()
+    for cls_id in predicted:
+        closure.add(cls_id)
+        # Add ancestors
+        ancestors = hierarchy.get_ancestors(cls_id)
+        closure.update(ancestors)
+    
+    # Step 3: Select top-K by probability
+    closure_list = list(closure)
+    closure_sorted = sorted(closure_list, key=lambda c: probs[c], reverse=True)
+    
+    # Apply max_labels constraint
+    if max_labels is not None:
+        selected = closure_sorted[:max_labels]
+    else:
+        selected = closure_sorted
+    
+    # Ensure min_labels
     if len(selected) < min_labels:
-        sorted_indices = np.argsort(probs)[::-1]
-        for idx in sorted_indices:
+        # Add more classes from original predictions
+        for idx in np.argsort(probs)[::-1]:
+            idx = int(idx)
             if idx not in selected:
-                selected.append(int(idx))
+                selected.append(idx)
             if len(selected) >= min_labels:
                 break
+    
     return selected
 
 
@@ -195,15 +267,27 @@ def load_model(model_path: str, hierarchy: TaxonomyHierarchy, device: str) -> Ta
     
     # Handle different checkpoint formats
     if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
         print("   Loaded from 'model_state_dict'")
     elif 'state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['state_dict'])
+        state_dict = checkpoint['state_dict']
         print("   Loaded from 'state_dict'")
     else:
         # Self-training models might only have state_dict at root
-        model.load_state_dict(checkpoint)
+        state_dict = checkpoint
         print("   Loaded from root level (self-training format)")
+    
+    # Check if state_dict has 'module.' prefix (saved from DataParallel)
+    has_module_prefix = any(k.startswith('module.') for k in state_dict.keys())
+    
+    if has_module_prefix:
+        print("   Detected DataParallel model, removing 'module.' prefix...")
+        # Remove 'module.' prefix from all keys
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    
+    # Load state dict (use strict=False to ignore edge_index buffer if present)
+    model.load_state_dict(state_dict, strict=False)
+    print("   ✅ State dict loaded successfully")
     
     model.to(device)
     model.eval()
@@ -233,6 +317,15 @@ def predict_classes(
     Returns:
         Probability predictions array (num_samples, num_classes)
     """
+    # Register edge_index as buffer in model (DataParallel-safe)
+    if not hasattr(model, 'edge_index') or model.edge_index is None:
+        model.register_buffer('edge_index', edge_index.to(device), persistent=False)
+    else:
+        model.edge_index.data = edge_index.to(device)
+    
+    # Set return_probs to True for inference
+    model.set_return_probs(True)
+    
     all_predictions = []
     
     print("\nGenerating predictions...")
@@ -241,9 +334,12 @@ def predict_classes(
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             
-            # Get probabilities
-            predictions = model(input_ids, attention_mask, edge_index, return_probs=True)
+            # Get probabilities (edge_index is stored as model buffer)
+            predictions = model(input_ids, attention_mask)
             all_predictions.append(predictions.cpu().numpy())
+    
+    # Reset return_probs to False
+    model.set_return_probs(False)
     
     predictions = np.vstack(all_predictions)
     return predictions
@@ -258,7 +354,8 @@ def generate_submission(
     max_labels: int = 3,  # Kaggle rule: at least 2 and at most 3 labels
     use_hierarchical_top1: bool = False,
     use_hierarchical_confidence: bool = False,
-    confidence_threshold: float = 0.5
+    confidence_threshold: float = 0.5,
+    pure_threshold: bool = False
 ):
     """
     Generate submission file for Kaggle competition
@@ -270,11 +367,15 @@ def generate_submission(
         threshold: Probability threshold for predictions
         min_labels: Minimum number of labels per sample
         max_labels: Maximum number of labels per sample
+        use_hierarchical_top1: Use hierarchical top-1 selection
+        use_hierarchical_confidence: Use hierarchical confidence path selection
+        confidence_threshold: Confidence threshold for hierarchical path
+        pure_threshold: Use pure threshold + ancestor closure (paper method)
     """
     print("="*80)
     print(" "*25 + "GENERATE SUBMISSION FILE")
     print("="*80)
-    
+    print(f"use_hierarchical_confidence: {use_hierarchical_confidence}, use_hierarchical_top1: {use_hierarchical_top1}")
     # Set device
     device = Config.DEVICE
     if device == "cuda" and not torch.cuda.is_available():
@@ -319,9 +420,10 @@ def generate_submission(
     
     print(f"Loaded {len(test_documents)} test documents")
     
-    """max_samples = 200
+    """for debugging"""
+    max_samples = 200
     test_pids = test_pids[:max_samples]
-    test_documents = test_documents[:max_samples]"""
+    test_documents = test_documents[:max_samples]
 
     # Create dataset and loader
     print("\nCreating test dataset...")
@@ -335,6 +437,7 @@ def generate_submission(
         tokenizer=tokenizer,
         max_length=Config.DOC_MAX_LENGTH
     )
+    
     
     test_loader = DataLoader(
         test_dataset,
@@ -351,6 +454,19 @@ def generate_submission(
         device=device,
         threshold=threshold,
     )
+    
+    # Save predictions
+    predictions_path = "predictions.npy"
+    print(f"\n💾 Saving predictions to {predictions_path}...")
+    np.save(predictions_path, predictions)
+    print(f"✅ Predictions saved: shape={predictions.shape}")
+    
+    # Also save test_pids for later use
+    test_pids_path = "test_pids.txt"
+    with open(test_pids_path, 'w', encoding='utf-8') as f:
+        for pid in test_pids:
+            f.write(f"{pid}\n")
+    print(f"✅ Test PIDs saved to {test_pids_path}")
     
     # Print prediction statistics
     print(f"\n📊 Prediction Statistics:")
@@ -384,16 +500,44 @@ def generate_submission(
     
     # Convert predictions to label lists
     print("\nConverting predictions to submission format...")
+    
+    # Print selected method
+    if pure_threshold:
+        print("📊 Using: Pure Threshold + Ancestor Closure (Paper Method)")
+    elif use_hierarchical_confidence:
+        print("📊 Using: Hierarchical Confidence Path")
+    elif use_hierarchical_top1:
+        print("📊 Using: Hierarchical Top-1")
+    else:
+        print("📊 Using: Threshold + Leaf-centric Post-processing (Default)")
+    
     all_pids = []
     all_labels = []
     
     for i, pid in enumerate(tqdm(test_pids, desc="Formatting predictions")):
         probs = predictions[i]
         
-        # Apply base selection strategy (probability-based)
-        if use_hierarchical_confidence:
+        # Apply selection strategy based on method
+        if pure_threshold:
+            # Pure threshold method (paper method)
+            predicted_classes = select_pure_threshold(
+                probs,
+                hierarchy=hierarchy,
+                threshold=threshold,
+                min_labels=min_labels,
+                max_labels=max_labels
+            )
+
+            all_pids.append(pid)
+            all_labels.append(sorted(predicted_classes))
+            continue
+        
+        # Other methods (with post-processing)
+        elif use_hierarchical_confidence:
+            # print(f"use_hierarchical_confidence: {use_hierarchical_confidence}")
             predicted_classes = select_hierarchical_confidence_path(
                 probs,
+                hierarchy=hierarchy,
                 level_nodes_cache=LEVEL_NODES_CACHE,
                 confidence_threshold=confidence_threshold,
                 min_labels=min_labels,
@@ -517,6 +661,10 @@ if __name__ == "__main__":
                         help="Use confidence-based hierarchical path selection")
     parser.add_argument("--confidence_threshold", type=float, default=0.5,
                         help="Confidence threshold for hierarchical path expansion")
+    parser.add_argument("--hier_top1", action="store_true",
+                        help="Use top-1 hierarchical selection")
+    parser.add_argument("--pure_threshold", action="store_true",
+                        help="Use pure threshold + ancestor closure method (paper method, no post-processing)")
     
     args = parser.parse_args()
     
@@ -528,6 +676,8 @@ if __name__ == "__main__":
         min_labels=args.min_labels,
         max_labels=args.max_labels,
         use_hierarchical_confidence=args.hier_confidence,
-        confidence_threshold=args.confidence_threshold
+        confidence_threshold=args.confidence_threshold,
+        use_hierarchical_top1=args.hier_top1,
+        pure_threshold=args.pure_threshold
     )
 

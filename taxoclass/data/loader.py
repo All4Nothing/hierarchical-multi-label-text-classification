@@ -46,7 +46,7 @@ class DocumentCorpus:
                         self.doc_ids.append(doc_id)
                         self.labels.append(-1) # 정답 없음(-1)으로 표시
                     
-                    self.doc_ids.append(idx)
+                    # Note: doc_ids는 위에서 이미 추가했으므로 여기서는 documents만 추가
                     self.documents.append(text)
         
         print(f"Loaded {len(self.documents)} documents from {self.corpus_file}")
@@ -144,68 +144,40 @@ def load_class_keywords(keywords_file: str) -> Dict[str, List[str]]:
 
 def create_multi_label_matrix(
     doc_labels: List[int],
-    core_class_assignments: Dict[int, int],
+    core_class_assignments: Dict[int, List[int]],
     hierarchy,
     num_classes: int
 ) -> np.ndarray:
     """
-    Create multi-label binary matrix
+    Create multi-label binary matrix from core class assignments
+    
+    Note: This function now delegates to create_training_labels from models.core_mining
+    which properly implements the hierarchical label generation as per TaxoClass paper.
     
     Args:
-        doc_labels: Ground truth labels for evaluation
-        core_class_assignments: Dict mapping doc_id to core_class_id
+        doc_labels: Ground truth labels for evaluation (not used, kept for compatibility)
+        core_class_assignments: Dict mapping doc_id to list of core_class_ids (multi-label)
         hierarchy: TaxonomyHierarchy object
         num_classes: Total number of classes
     
     Returns:
         Binary matrix (num_docs, num_classes)
-        1: positive, 0: negative, -1: ignore (descendants)
+        1: positive (core class or ancestor)
+        0: negative (other classes)
+        -1: ignore (descendants of core classes)
     """
+    from models.core_mining import create_training_labels
+    
     num_docs = len(doc_labels)
     
-    """# Validate and adjust num_classes if needed
-    if core_class_assignments:
-        max_core_class = max(core_class_assignments.values())
-        if max_core_class >= num_classes:
-            actual_num_classes = max_core_class + 1
-            print(f"⚠️  Warning: Max core class ID ({max_core_class}) >= num_classes ({num_classes})")
-            print(f"   Adjusting num_classes to {actual_num_classes}")
-            num_classes = actual_num_classes"""
-    
-    label_matrix = np.zeros((num_docs, num_classes), dtype=np.float32)
-    
-    for doc_id, core_class in core_class_assignments.items():
-        if doc_id >= num_docs:
-            continue
-        
-        # Validate core_class is within bounds
-        if core_class < 0 or core_class >= num_classes:
-            print(f"⚠️  Warning: Document {doc_id} has invalid core class ID {core_class} (valid range: 0-{num_classes-1}), skipping...")
-            continue
-        
-        # Positive: core class + ancestors
-        positive_classes = {core_class}
-        try:
-            ancestors = hierarchy.get_ancestors(core_class)
-            positive_classes.update(ancestors)
-        except (KeyError, AttributeError):
-            # If core_class not in hierarchy, skip ancestors
-            pass
-        
-        # Descendants (ignore)
-        try:
-            descendants = hierarchy.get_descendants(core_class)
-        except (KeyError, AttributeError):
-            descendants = set()
-        
-        # Set labels
-        for class_id in range(num_classes):
-            if class_id in positive_classes:
-                label_matrix[doc_id, class_id] = 1.0
-            elif class_id in descendants:
-                label_matrix[doc_id, class_id] = -1.0  # Ignore
-            else:
-                label_matrix[doc_id, class_id] = 0.0  # Negative
+    # Use the proper implementation from models.core_mining
+    # Pass num_docs to ensure correct size
+    label_matrix = create_training_labels(
+        core_classes_dict=core_class_assignments,
+        hierarchy=hierarchy,
+        num_classes=num_classes,
+        num_docs=num_docs
+    )
     
     return label_matrix
 
@@ -236,10 +208,19 @@ def create_ground_truth_matrix(
         max_label = max(doc_labels)
         min_label = min(doc_labels)
         
+        # Check if all labels are -1 (test corpus without ground truth)
+        all_negative = all(label == -1 for label in doc_labels)
+        
+        if all_negative:
+            # Test corpus without ground truth - this is expected, no warning needed
+            # Return zero matrix (no ground truth available)
+            return np.zeros((num_docs, num_classes), dtype=np.int32)
+        
         # 디버깅용 경고 출력 (필요시 주석 처리)
         if max_label >= num_classes:
             print(f"⚠️  Warning: Found label ID {max_label} >= num_classes ({num_classes}). This label will be IGNORED.")
-        if min_label < 0:
+        if min_label < 0 and not all_negative:
+            # Only warn if there are mixed negative and non-negative labels (unexpected case)
             print(f"⚠️  Warning: Found negative label ID {min_label}. This label will be IGNORED.")
     
     gt_matrix = np.zeros((num_docs, num_classes), dtype=np.int32)

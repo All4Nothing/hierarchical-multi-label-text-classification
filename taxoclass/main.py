@@ -63,7 +63,42 @@ def main():
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
         print("CUDA not available, using CPU")
-    print(f"Using device: {device}")
+    
+    # Check for multiple GPUs
+    # Note: You can limit which GPUs to use by setting CUDA_VISIBLE_DEVICES environment variable.
+    # Example: CUDA_VISIBLE_DEVICES=0,1 python main.py  (uses only GPU 0 and 1)
+    #          CUDA_VISIBLE_DEVICES=0,2,3 python main.py  (uses only GPU 0, 2, and 3)
+    #
+    # DataParallel Implementation Note:
+    # - We use torch.nn.DataParallel for simplicity (easy to implement, no process spawning)
+    # - For better performance, consider torch.nn.parallel.DistributedDataParallel (DDP):
+    #   * DDP is faster due to no GIL contention and efficient gradient communication
+    #   * DDP requires multi-process setup (torch.distributed.launch or torch.multiprocessing)
+    #   * DDP is more complex but recommended for serious training
+    # - Current implementation uses DataParallel with special handling:
+    #   * edge_index stored as model buffer (not split across GPUs)
+    #   * return_probs controlled via model method (not keyword arg)
+    #   * This avoids DataParallel's issues with non-tensor arguments
+    use_multi_gpu = False
+    num_gpus = 0
+    if device == "cuda" and torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        if num_gpus > 1:
+            use_multi_gpu = True
+            print(f"Found {num_gpus} GPUs. Using DataParallel for multi-GPU training.")
+        else:
+            print(f"Found {num_gpus} GPU. Using single GPU.")
+    else:
+        print(f"Using device: {device}")
+    
+    # Set main device (first GPU for DataParallel)
+    # When using CUDA_VISIBLE_DEVICES, the visible GPUs are renumbered starting from 0
+    if use_multi_gpu:
+        main_device = "cuda:0"
+        print(f"Main device: {main_device} (DataParallel will use all {num_gpus} GPUs)")
+    else:
+        main_device = device
+        print(f"Using device: {main_device}")
     
     # Initialize wandb
     use_wandb = Config.USE_WANDB and WANDB_AVAILABLE
@@ -113,12 +148,6 @@ def main():
                 # Optimization config
                 "use_mixed_precision": Config.USE_MIXED_PRECISION,
                 "num_workers": Config.NUM_WORKERS,
-                
-                # Data usage strategy
-                "use_test_in_stage1": Config.USE_TEST_IN_STAGE1,
-                "use_test_in_stage2": Config.USE_TEST_IN_STAGE2,
-                "use_test_in_stage3": Config.USE_TEST_IN_STAGE3,
-                "use_test_in_stage4": Config.USE_TEST_IN_STAGE4,
             },
             tags=Config.WANDB_TAGS
         )
@@ -164,16 +193,21 @@ def main():
         actual_num_classes = hierarchy.num_classes if hasattr(hierarchy, 'num_classes') else 0
     
     # Validate train and test labels (but don't let them override hierarchy)
+    # Note: Both train and test corpus may have no labels (all -1) in weakly-supervised setting
     if train_labels:
         train_max_id = max(train_labels)
-        if train_max_id >= actual_num_classes:
+        train_min_id = min(train_labels)
+        # Skip validation if all labels are -1 (no ground truth available)
+        if train_min_id >= 0 and train_max_id >= actual_num_classes:
             # Only warn, don't automatically adjust (hierarchy is source of truth)
             print(f"⚠️  Warning: Train labels contain class ID {train_max_id} >= num_classes ({actual_num_classes})")
             print(f"   This may indicate a data issue. Using hierarchy-based num_classes: {actual_num_classes}")
     
     if test_labels:
         test_max_id = max(test_labels)
-        if test_max_id >= actual_num_classes:
+        test_min_id = min(test_labels)
+        # Skip validation if all labels are -1 (no ground truth available)
+        if test_min_id >= 0 and test_max_id >= actual_num_classes:
             print(f"⚠️  Warning: Test labels contain class ID {test_max_id} >= num_classes ({actual_num_classes})")
             print(f"   This may indicate a data issue. Using hierarchy-based num_classes: {actual_num_classes}")
     
@@ -195,59 +229,88 @@ def main():
     # =========================================================================
     # Stage 1: Document-Class Similarity Calculation
     # =========================================================================
-    print("\n" + "="*80)
-    print("STAGE 1: DOCUMENT-CLASS SIMILARITY CALCULATION")
-    print("="*80)
+    start_from_stage = getattr(Config, 'START_FROM_STAGE', None)
+    if start_from_stage is None:
+        start_from_stage = 1
     
-    # Option 1: Use full NLI model (more accurate but slower)
-    use_fast_similarity = True  # Set to False for full NLI model
+    stage1_documents = train_documents + test_documents
     
-    if use_fast_similarity:
-        print("\nUsing fast similarity calculator (sentence transformers)...")
-        similarity_calculator = FastSimilarityCalculator(
-            device=device,
-            batch_size=Config.SIMILARITY_BATCH_SIZE,
-            cache_dir=Config.CACHE_DIR
-        )
-    else:
-        print("\nUsing textual entailment model (RoBERTa-MNLI)...")
-        similarity_calculator = DocumentClassSimilarity(
-            model_name=Config.SIMILARITY_MODEL,
-            hypothesis_template=Config.HYPOTHESIS_TEMPLATE,
-            device=device,
-            batch_size=Config.SIMILARITY_BATCH_SIZE,
-            max_length=Config.SIMILARITY_MAX_LENGTH,
-            cache_dir=Config.CACHE_DIR
-        )
-    
-    # Compute similarity matrix for training data
-    # Use test data in Stage 1 if configured (transductive learning)
-    if Config.USE_TEST_IN_STAGE1:
-        print("\n🔄 Stage 1: Using TRAIN + TEST data (transductive learning)")
-        stage1_documents = train_documents + test_documents
-        print(f"Total documents for similarity: {len(stage1_documents)} (train: {len(train_documents)}, test: {len(test_documents)})")
-    else:
-        print("\n📊 Stage 1: Using TRAIN data only")
-        stage1_documents = train_documents
-        print(f"Total documents for similarity: {len(stage1_documents)}")
-    
-    print("\nComputing similarity matrix...")
-    similarity_matrix_all = similarity_calculator.compute_similarity_matrix(
-        documents=stage1_documents,
-        class_names=hierarchy.id_to_name,
-        use_cache=True
-    )
-    
-    # Split similarity matrix back to train/test
-    train_similarity_matrix = similarity_matrix_all[:len(train_documents)]
-    if Config.USE_TEST_IN_STAGE1:
+    # Check if we should skip Stage 1
+    similarity_save_path = os.path.join(Config.OUTPUT_DIR, "similarity_matrix_all.npz")
+    if start_from_stage > 1 and os.path.exists(similarity_save_path):
+        print("\n" + "="*80)
+        print("STAGE 1: DOCUMENT-CLASS SIMILARITY CALCULATION (SKIPPED - LOADING FROM FILE)")
+        print("="*80)
+        print(f"Loading similarity matrix from {similarity_save_path}...")
+        similarity_data = np.load(similarity_save_path)
+        similarity_matrix_all = similarity_data['similarity_matrix']
+        print(f"✅ Loaded similarity matrix: {similarity_matrix_all.shape}")
+        print(f"   Size: {similarity_matrix_all.nbytes / 1024 / 1024:.2f} MB")
+        
+        # Verify dimensions match
+        expected_train_size = len(train_documents)
+        expected_test_size = len(test_documents)
+        loaded_train_size = similarity_data.get('train_size', expected_train_size)
+        loaded_test_size = similarity_data.get('test_size', expected_test_size)
+        
+        if loaded_train_size != expected_train_size or loaded_test_size != expected_test_size:
+            print(f"⚠️  Warning: Document counts don't match!")
+            print(f"   Expected: train={expected_train_size}, test={expected_test_size}")
+            print(f"   Loaded: train={loaded_train_size}, test={loaded_test_size}")
+            print(f"   Proceeding anyway, but results may be incorrect.")
+        
+        # Split similarity matrix back to train/test
+        train_similarity_matrix = similarity_matrix_all[:len(train_documents)]
         test_similarity_matrix = similarity_matrix_all[len(train_documents):]
         print(f"Train similarity matrix shape: {train_similarity_matrix.shape}")
         print(f"Test similarity matrix shape: {test_similarity_matrix.shape}")
+        print(f"Similarity range: [{train_similarity_matrix.min():.4f}, {train_similarity_matrix.max():.4f}]")
     else:
-        print(f"Similarity matrix shape: {train_similarity_matrix.shape}")
-    
-    print(f"Similarity range: [{train_similarity_matrix.min():.4f}, {train_similarity_matrix.max():.4f}]")
+        print("\n" + "="*80)
+        print("STAGE 1: DOCUMENT-CLASS SIMILARITY CALCULATION")
+        print("="*80)
+
+        similarity_calculator = DocumentClassSimilarity(
+            model_name=Config.SIMILARITY_MODEL,
+            hypothesis_template=Config.HYPOTHESIS_TEMPLATE,
+            device=main_device,
+            batch_size=Config.SIMILARITY_BATCH_SIZE,
+            max_length=Config.SIMILARITY_MAX_LENGTH,
+            cache_dir=Config.CACHE_DIR,
+            use_multi_gpu=use_multi_gpu
+        )
+        
+        # Compute similarity matrix for training data
+        print(f"Total documents for similarity: {len(stage1_documents)} (train: {len(train_documents)}, test: {len(test_documents)})")
+
+        
+        print("\nComputing similarity matrix...")
+        similarity_matrix_all = similarity_calculator.compute_similarity_matrix(
+            documents=stage1_documents,
+            class_names=hierarchy.id_to_name,
+            use_cache=True
+        )
+        
+        # Save similarity matrix to file
+        print(f"\nSaving similarity matrix to {similarity_save_path}...")
+        np.savez_compressed(
+            similarity_save_path,
+            similarity_matrix=similarity_matrix_all,
+            num_documents=len(stage1_documents),
+            num_classes=len(hierarchy.id_to_name),
+            train_size=len(train_documents),
+            test_size=len(test_documents)
+        )
+        print(f"✅ Similarity matrix saved: {similarity_save_path}")
+        print(f"   Shape: {similarity_matrix_all.shape}, Size: {similarity_matrix_all.nbytes / 1024 / 1024:.2f} MB")
+        
+        # Split similarity matrix back to train/test
+        train_similarity_matrix = similarity_matrix_all[:len(train_documents)]
+        test_similarity_matrix = similarity_matrix_all[len(train_documents):]
+        print(f"Train similarity matrix shape: {train_similarity_matrix.shape}")
+        print(f"Test similarity matrix shape: {test_similarity_matrix.shape}")
+        
+        print(f"Similarity range: [{train_similarity_matrix.min():.4f}, {train_similarity_matrix.max():.4f}]")
     
     # Log to wandb
     if use_wandb:
@@ -257,55 +320,77 @@ def main():
             "stage1/similarity_mean": float(train_similarity_matrix.mean()),
             "stage1/similarity_std": float(train_similarity_matrix.std()),
             "stage1/num_documents": len(stage1_documents),
-            "stage1/use_test_data": Config.USE_TEST_IN_STAGE1,
         })
     
     # =========================================================================
     # Stage 2: Core Class Mining
     # =========================================================================
-    print("\n" + "="*80)
-    print("STAGE 2: CORE CLASS MINING")
-    print("="*80)
+    stage2_documents = stage1_documents
     
-    # Stage 2: Core Class Mining
-    # Use test data if configured
-    if Config.USE_TEST_IN_STAGE2 and Config.USE_TEST_IN_STAGE1:
-        print("\n🔄 Stage 2: Using TRAIN + TEST data for core class mining")
-        stage2_similarity_matrix = similarity_matrix_all
-        stage2_documents = stage1_documents
+    # Check if we should skip Stage 2
+    core_classes_save_path = os.path.join(Config.OUTPUT_DIR, "core_classes.npz")
+    if start_from_stage > 2 and os.path.exists(core_classes_save_path):
+        print("\n" + "="*80)
+        print("STAGE 2: CORE CLASS MINING (SKIPPED - LOADING FROM FILE)")
+        print("="*80)
+        print(f"Loading core classes from {core_classes_save_path}...")
+        core_data = np.load(core_classes_save_path, allow_pickle=True)
+        core_classes_dict = core_data['core_classes'].item()  # Convert numpy array back to dict
+        core_classes = {int(k): int(v) for k, v in core_classes_dict.items()}
+        print(f"✅ Loaded core classes for {len(core_classes)} documents")
+        
+        # Log summary
+        unique_core_classes = len(set(core_classes.values()))
+        print(f"   Unique core classes: {unique_core_classes}")
     else:
-        print("\n📊 Stage 2: Using TRAIN data only for core class mining")
-        stage2_similarity_matrix = train_similarity_matrix
-        stage2_documents = train_documents
-    
-    # Initialize core class miner
-    core_miner = CoreClassMiner(
-        hierarchy=hierarchy,
-        similarity_matrix=stage2_similarity_matrix,
-        candidate_power=Config.CANDIDATE_SELECTION_POWER,
-        confidence_percentile=Config.CONFIDENCE_THRESHOLD_PERCENTILE
-    )
-    
-    # Identify core classes
-    core_classes = core_miner.identify_core_classes()
-    
-    # Analyze results
-    analyzer = CoreClassAnalyzer(core_miner, hierarchy)
-    analyzer.print_summary()
+        print("\n" + "="*80)
+        print("STAGE 2: CORE CLASS MINING")
+        print("="*80)
+        
+        # Initialize core class miner
+        core_miner = CoreClassMiner(
+            hierarchy=hierarchy,
+            similarity_matrix=similarity_matrix_all,
+            candidate_power=Config.CANDIDATE_SELECTION_POWER,
+            confidence_percentile=Config.CONFIDENCE_THRESHOLD_PERCENTILE
+        )
+        
+        # Identify core classes
+        core_classes = core_miner.identify_core_classes()
+        
+        # Analyze results
+        analyzer = CoreClassAnalyzer(core_miner, hierarchy)
+        analyzer.print_summary()
+        
+        # Save core classes to file
+        print(f"\nSaving core classes to {core_classes_save_path}...")
+        np.savez_compressed(
+            core_classes_save_path,
+            core_classes=core_classes,
+            num_documents=len(stage2_documents)
+        )
+        print(f"✅ Core classes saved: {core_classes_save_path}")
     
     # Log to wandb
     if use_wandb:
-        # core_classes is {doc_id: core_class_id}
+        # core_classes is now {doc_id: [class_id1, class_id2, ...]} (multi-label)
         total_docs_with_core = len(core_classes)
-        unique_core_classes = len(set(core_classes.values()))
-        avg_docs_per_core_class = total_docs_with_core / unique_core_classes if unique_core_classes > 0 else 0
+        
+        # Flatten all core classes to get unique classes
+        all_core_classes = []
+        for doc_id, class_list in core_classes.items():
+            all_core_classes.extend(class_list)
+        
+        unique_core_classes = len(set(all_core_classes))
+        total_core_class_assignments = len(all_core_classes)
+        avg_core_classes_per_doc = total_core_class_assignments / total_docs_with_core if total_docs_with_core > 0 else 0
         
         wandb.log({
-            "stage2/num_core_classes": unique_core_classes,
+            "stage2/num_unique_core_classes": unique_core_classes,
+            "stage2/total_core_class_assignments": total_core_class_assignments,
+            "stage2/avg_core_classes_per_doc": avg_core_classes_per_doc,
             "stage2/total_docs_with_core": total_docs_with_core,
-            "stage2/avg_docs_per_core_class": avg_docs_per_core_class,
             "stage2/num_documents": len(stage2_documents),
-            "stage2/use_test_data": Config.USE_TEST_IN_STAGE2 and Config.USE_TEST_IN_STAGE1,
         })
     
     # Filter low confidence documents (optional)
@@ -314,116 +399,12 @@ def main():
     # =========================================================================
     # Stage 3: Classifier Training
     # =========================================================================
-    print("\n" + "="*80)
-    print("STAGE 3: CLASSIFIER TRAINING")
-    print("="*80)
     
-    # Stage 3: Decide which documents to use for training
-    if Config.USE_TEST_IN_STAGE3 and Config.USE_TEST_IN_STAGE2 and Config.USE_TEST_IN_STAGE1:
-        print("\n🔄 Stage 3: Using TRAIN + TEST data for classifier training")
-        stage3_documents = stage2_documents
-        stage3_labels = train_labels + test_labels
-        
-        # Create label matrix for all documents
-        # Note: Core classes from Stage 2 already include both train and test
-        stage3_label_matrix = create_multi_label_matrix(
-            doc_labels=stage3_labels,
-            core_class_assignments=core_classes,
-            hierarchy=hierarchy,
-            num_classes=actual_num_classes
-        )
-        
-        # Split back to train/test for validation split
-        train_label_matrix = stage3_label_matrix[:len(train_documents)]
-        test_label_matrix_stage3 = stage3_label_matrix[len(train_documents):]
-        
-        print(f"Total documents for training: {len(stage3_documents)}")
-        print(f"  - Train: {len(train_documents)}, Test: {len(test_documents)}")
-    else:
-        print("\n📊 Stage 3: Using TRAIN data only for classifier training")
-        stage3_documents = train_documents
-        stage3_labels = train_labels
-        
-        # Create multi-label training matrix (train only)
-        train_label_matrix = create_multi_label_matrix(
-            doc_labels=train_labels,
-            core_class_assignments=core_classes,
-            hierarchy=hierarchy,
-            num_classes=actual_num_classes
-        )
-    
-    print(f"\nTraining label matrix shape: {train_label_matrix.shape}")
-    print(f"Positive labels: {(train_label_matrix == 1).sum()}")
-    print(f"Negative labels: {(train_label_matrix == 0).sum()}")
-    print(f"Ignored labels: {(train_label_matrix == -1).sum()}")
-    
-    # Log to wandb
-    if use_wandb:
-        wandb.log({
-            "stage3/num_positive_labels": int((train_label_matrix == 1).sum()),
-            "stage3/num_negative_labels": int((train_label_matrix == 0).sum()),
-            "stage3/num_ignored_labels": int((train_label_matrix == -1).sum()),
-            "stage3/positive_ratio": float((train_label_matrix == 1).sum() / (train_label_matrix >= 0).sum()),
-            "stage3/use_test_data": Config.USE_TEST_IN_STAGE3 and Config.USE_TEST_IN_STAGE2 and Config.USE_TEST_IN_STAGE1,
-        })
-    
-    # Load tokenizer
+    # Load tokenizer (needed for all stages)
     print("\nLoading tokenizer...")
     tokenizer = BertTokenizer.from_pretrained(Config.DOC_ENCODER_MODEL)
     
-    # Create datasets
-    print("\nCreating training dataset...")
-    if Config.USE_TEST_IN_STAGE3 and Config.USE_TEST_IN_STAGE2 and Config.USE_TEST_IN_STAGE1:
-        # Use all documents (train + test)
-        all_label_matrix = stage3_label_matrix
-        train_dataset = TaxoDataset(
-            documents=stage3_documents,
-            labels=all_label_matrix,
-            tokenizer=tokenizer,
-            max_length=Config.DOC_MAX_LENGTH
-        )
-    else:
-        # Use train only
-        train_dataset = TaxoDataset(
-            documents=train_documents,
-            labels=train_label_matrix,
-            tokenizer=tokenizer,
-            max_length=Config.DOC_MAX_LENGTH
-        )
-    
-    # Split into train/val (90/10)
-    train_size = int(0.9 * len(train_dataset))
-    val_size = len(train_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        train_dataset,
-        [train_size, val_size]
-    )
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=Config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=0
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=Config.EVAL_BATCH_SIZE,
-        shuffle=False,
-        num_workers=0
-    )
-    
-    print(f"Training samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
-    
-    # Log to wandb
-    if use_wandb:
-        wandb.log({
-            "stage3/train_samples": len(train_dataset),
-            "stage3/val_samples": len(val_dataset),
-        })
-    
-    # Initialize model
+    # Initialize model (needed for all stages)
     print("\nInitializing TaxoClassifier...")
     model = TaxoClassifier(
         num_classes=actual_num_classes,  # Use actual_num_classes instead of hierarchy.num_classes
@@ -435,44 +416,154 @@ def main():
         freeze_bert=False
     )
     
-    # Initialize class embeddings with BERT
+    # Initialize class embeddings with BERT using model's built-in method
     print("\nInitializing class embeddings...")
-    class_embeddings = initialize_class_embeddings_with_bert(
+    model.initialize_class_embeddings(
         class_names=hierarchy.id_to_name,
-        bert_model_name=Config.DOC_ENCODER_MODEL,
-        device=device
+        device=main_device
     )
-    model.class_embeddings.data = class_embeddings.to(device)
     
     # Get edge index for GNN (direction controlled by Config)
     edge_index = torch.LongTensor(
         hierarchy.get_edge_index(bidirectional=Config.GNN_BIDIRECTIONAL_EDGES)
     )
     
-    # Initialize trainer
-    print("\nInitializing trainer...")
-    trainer = TaxoClassifierTrainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        edge_index=edge_index,
-        device=device,
-        learning_rate=Config.LEARNING_RATE,
-        num_epochs=Config.NUM_EPOCHS,
-        warmup_steps=Config.WARMUP_STEPS,
-        weight_decay=Config.WEIGHT_DECAY,
-        save_dir=Config.MODEL_SAVE_DIR,
-        use_wandb=use_wandb,
-        use_mixed_precision=Config.USE_MIXED_PRECISION,
-        gradient_accumulation_steps=getattr(Config, 'GRADIENT_ACCUMULATION_STEPS', 1)
-    )
-    
-    # Train model
-    print("\nTraining classifier...")
-    trainer.train()
-    
-    # Load best model
-    trainer.load_model("best_model.pt")
+    # Check if we should skip Stage 3 (training)
+    best_model_path = os.path.join(Config.MODEL_SAVE_DIR, "best_model.pt")
+    if start_from_stage > 3 and os.path.exists(best_model_path):
+        print("\n" + "="*80)
+        print("STAGE 3: CLASSIFIER TRAINING (SKIPPED - LOADING FROM FILE)")
+        print("="*80)
+        print(f"Loading trained model from {best_model_path}...")
+        
+        # IMPORTANT: Register edge_index as buffer BEFORE loading state dict
+        # This ensures the buffer is part of the model structure
+        print("\nRegistering edge_index as model buffer...")
+        model.register_buffer('edge_index', edge_index)
+        print(f"✅ edge_index registered: shape {edge_index.shape}")
+        
+        # Load model state dict
+        checkpoint = torch.load(best_model_path, map_location=main_device)
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            # Load state dict with strict=False to allow missing/extra keys
+            # edge_index buffer is newly added, so it's not in the saved checkpoint
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            print(f"✅ Loaded model from checkpoint (epoch {checkpoint.get('epoch', 'unknown')})")
+        else:
+            model.load_state_dict(checkpoint, strict=False)
+            print(f"✅ Loaded model state dict")
+        
+        # Move model to device
+        model = model.to(main_device)
+        
+        # Wrap with DataParallel if using multi-GPU
+        # IMPORTANT: This must be done AFTER registering edge_index and loading state dict
+        if use_multi_gpu:
+            model = torch.nn.DataParallel(model)
+            print(f"✅ Model wrapped with DataParallel for {num_gpus} GPUs")
+        
+        model.eval()
+        print("Model loaded and ready for Stage 4")
+    else:
+        print("\n" + "="*80)
+        print("STAGE 3: CLASSIFIER TRAINING")
+        print("="*80)
+        
+        stage3_documents = stage2_documents
+        stage3_labels = train_labels + test_labels
+
+        # Create label matrix for all documents
+        stage3_label_matrix = create_multi_label_matrix(
+            doc_labels=stage3_labels,
+            core_class_assignments=core_classes,
+            hierarchy=hierarchy,
+            num_classes=actual_num_classes
+        )
+
+        # Split back to train/test for validation split
+        train_label_matrix = stage3_label_matrix[:len(train_documents)]
+        test_label_matrix = stage3_label_matrix[len(train_documents):]
+            
+        print(f"\nTraining label matrix shape: {train_label_matrix.shape}")
+        print(f"Positive labels: {(train_label_matrix == 1).sum()}")
+        print(f"Negative labels: {(train_label_matrix == 0).sum()}")
+        print(f"Ignored labels: {(train_label_matrix == -1).sum()}")
+        
+        # Log to wandb
+        if use_wandb:
+            wandb.log({
+                "stage3/num_positive_labels": int((train_label_matrix == 1).sum()),
+                "stage3/num_negative_labels": int((train_label_matrix == 0).sum()),
+                "stage3/num_ignored_labels": int((train_label_matrix == -1).sum()),
+                "stage3/positive_ratio": float((train_label_matrix == 1).sum() / (train_label_matrix >= 0).sum()),
+            })
+        
+        # Create datasets
+        print("\nCreating training dataset...")
+        train_dataset = TaxoDataset(
+                documents=train_documents,
+                labels=train_label_matrix,
+                tokenizer=tokenizer,
+                max_length=Config.DOC_MAX_LENGTH
+            )
+        
+        # Split into train/val (90/10)
+        train_size = int(0.9 * len(train_dataset))
+        val_size = len(train_dataset) - train_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            train_dataset,
+            [train_size, val_size]
+        )
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            num_workers=0
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=Config.EVAL_BATCH_SIZE,
+            shuffle=False,
+            num_workers=0
+        )
+        
+        print(f"Training samples: {len(train_dataset)}")
+        print(f"Validation samples: {len(val_dataset)}")
+        
+        # Log to wandb
+        if use_wandb:
+            wandb.log({
+                "stage3/train_samples": len(train_dataset),
+                "stage3/val_samples": len(val_dataset),
+            })
+        
+        # Initialize trainer
+        print("\nInitializing trainer...")
+        trainer = TaxoClassifierTrainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            edge_index=edge_index,
+            device=main_device,
+            learning_rate=Config.LEARNING_RATE,
+            num_epochs=Config.NUM_EPOCHS,
+            warmup_steps=Config.WARMUP_STEPS,
+            weight_decay=Config.WEIGHT_DECAY,
+            save_dir=Config.MODEL_SAVE_DIR,
+            use_wandb=use_wandb,
+            use_mixed_precision=Config.USE_MIXED_PRECISION,
+            gradient_accumulation_steps=getattr(Config, 'GRADIENT_ACCUMULATION_STEPS', 1),
+            use_multi_gpu=use_multi_gpu
+        )
+        
+        # Train model
+        print("\nTraining classifier...")
+        trainer.train()
+        
+        # Load best model
+        trainer.load_model("best_model.pt")
     
     # =========================================================================
     # Stage 4: Self-Training (Optional)
@@ -485,15 +576,9 @@ def main():
         print("="*80)
         
         # Stage 4: Decide which documents to use for self-training
-        if Config.USE_TEST_IN_STAGE4 and Config.USE_TEST_IN_STAGE1:
-            print("\n🔄 Stage 4: Using TRAIN + TEST data for self-training")
-            stage4_documents = stage1_documents  # train + test
-            print(f"Total documents for self-training: {len(stage4_documents)}")
-            print(f"  - Train: {len(train_documents)}, Test: {len(test_documents)}")
-        else:
-            print("\n📊 Stage 4: Using TRAIN data only for self-training")
-            stage4_documents = train_documents
-            print(f"Total documents for self-training: {len(stage4_documents)}")
+        stage4_documents = stage1_documents  # train + test
+        print(f"Total documents for self-training: {len(stage4_documents)}")
+        print(f"  - Train: {len(train_documents)}, Test: {len(test_documents)}")
         
         # Create unlabeled dataset
         print("\nCreating unlabeled dataset...")
@@ -509,14 +594,15 @@ def main():
             model=model,
             unlabeled_loader=unlabeled_loader,
             edge_index=edge_index,
-            device=device,
+            device=main_device,
             num_iterations=Config.SELF_TRAIN_ITERATIONS,
             num_epochs_per_iter=Config.SELF_TRAIN_EPOCHS_PER_ITER,
             temperature=Config.SELF_TRAIN_TEMPERATURE,
             threshold=Config.SELF_TRAIN_THRESHOLD,
             learning_rate=Config.SELF_TRAIN_LR,
             save_dir=Config.MODEL_SAVE_DIR,
-            use_wandb=use_wandb
+            use_wandb=use_wandb,
+            use_multi_gpu=use_multi_gpu
         )
         
         # Run self-training
@@ -524,6 +610,9 @@ def main():
         
         # Load final model
         self_trainer.load_model(f"self_train_iter_{Config.SELF_TRAIN_ITERATIONS}.pt")
+        
+        # Update model reference for evaluation (in case it was wrapped/modified by SelfTrainer)
+        model = self_trainer.model
     
     # =========================================================================
     # Evaluation
@@ -556,7 +645,7 @@ def main():
         edge_index=edge_index,
         ground_truth=test_ground_truth,
         hierarchy=hierarchy,
-        device=device,
+        device=main_device,
         threshold=0.5,
         top_k_values=Config.TOP_K
     )

@@ -29,11 +29,12 @@ class SelfTrainer:
         device: str = "cuda",
         num_iterations: int = 5,
         num_epochs_per_iter: int = 3,
-        temperature: float = 2.0,
+        temperature: float = 0.5,  # Changed from 2.0 to 0.5 for sharpening
         threshold: float = 0.5,
         learning_rate: float = 1e-5,
         save_dir: str = "./saved_models",
-        use_wandb: bool = False
+        use_wandb: bool = False,
+        use_multi_gpu: bool = False
     ):
         """
         Initialize self-trainer
@@ -50,10 +51,34 @@ class SelfTrainer:
             learning_rate: Learning rate for self-training
             save_dir: Directory to save models
             use_wandb: Whether to use wandb logging
+            use_multi_gpu: Whether to use DataParallel for multi-GPU training
         """
-        self.model = model.to(device)
+        # Get actual model (unwrap DataParallel if needed)
+        actual_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+        
+        # Register edge_index as buffer in the actual model (not the DataParallel wrapper)
+        if not hasattr(actual_model, 'edge_index') or actual_model.edge_index is None:
+            actual_model.register_buffer('edge_index', edge_index.to(device), persistent=False)
+            print(f"✅ Registered edge_index as buffer in model")
+        else:
+            actual_model.edge_index.data = edge_index.to(device)
+            print(f"✅ Updated edge_index buffer in model")
+        
+        # Store the model (may already be wrapped in DataParallel)
+        self.model = model
+        
+        # Check if already wrapped in DataParallel
+        is_data_parallel = isinstance(self.model, torch.nn.DataParallel)
+        
+        if use_multi_gpu and torch.cuda.device_count() > 1:
+            if is_data_parallel:
+                print(f"✅ Model already wrapped with DataParallel ({torch.cuda.device_count()} GPUs)")
+            else:
+                self.model = torch.nn.DataParallel(self.model)
+                print(f"✅ Wrapped model with DataParallel ({torch.cuda.device_count()} GPUs)")
+        
         self.unlabeled_loader = unlabeled_loader
-        self.edge_index = edge_index.to(device)
+        self.edge_index = edge_index.to(device)  # Keep for backward compatibility
         self.device = device
         self.num_iterations = num_iterations
         self.num_epochs_per_iter = num_epochs_per_iter
@@ -62,6 +87,7 @@ class SelfTrainer:
         self.learning_rate = learning_rate
         self.save_dir = save_dir
         self.use_wandb = use_wandb and WANDB_AVAILABLE
+        self.use_multi_gpu = use_multi_gpu
         
         os.makedirs(save_dir, exist_ok=True)
     
@@ -72,15 +98,22 @@ class SelfTrainer:
         threshold: float = None
     ) -> torch.Tensor:
         """
-        Compute target distribution Q from predictions P
+        Compute target distribution Q from predictions P for multi-label classification
         
-        Q_ij = P_ij^(1/T) / Σ_k P_ik^(1/T)  if P_ij > threshold
-             = 0                           otherwise
+        Paper: "Strengthen high-confidence predictions and suppress low-confidence ones"
+        
+        For multi-label problems, we apply temperature sharpening independently to each class
+        without row-wise normalization (unlike multi-class problems).
+        
+        Q_ij = P_ij^(1/T)  if P_ij > threshold
+             = 0           otherwise
         
         Args:
             predictions: Model predictions (num_samples, num_classes)
-            temperature: Temperature parameter (default: self.temperature)
-            threshold: Threshold parameter (default: self.threshold)
+            temperature: Temperature parameter for sharpening (default: self.temperature)
+                        T < 1 (e.g., 0.5): Sharpen distribution (strengthen high confidence)
+                        T > 1 (e.g., 2.0): Smooth distribution (weaken high confidence)
+            threshold: Threshold for filtering low-confidence predictions (default: self.threshold)
         
         Returns:
             Target distribution Q (num_samples, num_classes)
@@ -90,24 +123,24 @@ class SelfTrainer:
         if threshold is None:
             threshold = self.threshold
         
-        """# Temperature scaling
+        # Clamp predictions to avoid numerical issues
+        predictions = torch.clamp(predictions, min=1e-7, max=1-1e-7)
+        
+        # Temperature sharpening: emphasize high probabilities, suppress low ones
+        # With T < 1 (e.g., 0.5): P^(1/0.5) = P^2 → high P gets higher, low P gets lower
+        # This strengthens high-confidence predictions as intended by the paper
         Q = torch.pow(predictions, 1.0 / temperature)
         
-        # Apply threshold
-        Q[predictions < threshold] = 0.0
+        # Apply threshold: set low-confidence predictions to 0
+        # This filters out uncertain predictions
+        Q = Q * (predictions > threshold).float()
         
-        # Normalize (per sample)
-        Q_sum = Q.sum(dim=1, keepdim=True)
-        Q = Q / (Q_sum + 1e-10)
+        # Clamp Q to valid probability range
+        Q = torch.clamp(Q, min=0.0, max=1.0)
         
-        # Handle cases where all predictions are below threshold
-        zero_rows = (Q_sum.squeeze() == 0)
-        if zero_rows.any():
-            # Keep original predictions for these samples
-            Q[zero_rows] = predictions[zero_rows]"""
-        
-        # Hard Pseudo-labeling for convenience
-        Q = (predictions > threshold).float()
+        # For multi-label classification, we do NOT normalize across classes
+        # Each class probability is independent
+        # This preserves the multi-label nature of the problem
         
         return Q
     
@@ -126,7 +159,12 @@ class SelfTrainer:
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 
-                predictions = self.model(input_ids, attention_mask, self.edge_index)
+                # edge_index is stored as model buffer
+                # Set return_probs using model method to avoid DataParallel keyword arg issues
+                actual_model = self.model.module if hasattr(self.model, 'module') else self.model
+                actual_model.set_return_probs(True)
+                predictions = self.model(input_ids, attention_mask)
+                actual_model.set_return_probs(False)
                 all_predictions.append(predictions.cpu())
         
         all_predictions = torch.cat(all_predictions, dim=0)
@@ -140,26 +178,36 @@ class SelfTrainer:
         """
         Compute KL divergence: D_KL(Q || P)
         
+        Paper formula: D_KL(Q || P) = Σ Q * log(Q / P) - Σ Q + Σ P
+                                    = Σ Q * log(Q / P) - Σ (Q - P)
+        
+        For multi-label with independent binary classification per class:
+        We use binary KL divergence for each class:
+        KL(q || p) = q * log(q/p) + (1-q) * log((1-q)/(1-p))
+        
         Args:
-            predictions: Model predictions P
+            predictions: Model predictions P (probabilities after sigmoid)
             target_distribution: Target distribution Q
         
         Returns:
             KL divergence loss
         """
-        # KL(Q || P) = Σ Q * log(Q / P)
-        #            = Σ Q * (log(Q) - log(P))
-        
         # Add small epsilon for numerical stability
-        eps = 1e-10
-        log_predictions = torch.log(predictions + eps)
-        log_target = torch.log(target_distribution + eps)
+        eps = 1e-7
         
-        # Only compute loss for non-zero target probabilities
-        mask = (target_distribution > 0).float()
+        # Clamp to valid probability range
+        predictions = torch.clamp(predictions, min=eps, max=1-eps)
+        target_distribution = torch.clamp(target_distribution, min=eps, max=1-eps)
         
-        kl_loss = target_distribution * (log_target - log_predictions)
-        kl_loss = (kl_loss * mask).sum(dim=1).mean()
+        # Binary KL divergence for each class (multi-label)
+        # KL(q || p) = q * log(q/p) + (1-q) * log((1-q)/(1-p))
+        kl_pos = target_distribution * torch.log(target_distribution / predictions)
+        kl_neg = (1 - target_distribution) * torch.log((1 - target_distribution) / (1 - predictions))
+        
+        kl_loss = kl_pos + kl_neg
+        
+        # Average over all elements
+        kl_loss = kl_loss.mean()
         
         return kl_loss
     
@@ -169,7 +217,7 @@ class SelfTrainer:
         target_distribution: torch.Tensor
     ):
         """
-        Train for one self-training iteration
+        Train for one self-training iteration using KL Divergence loss
         
         Args:
             iteration: Iteration number
@@ -182,9 +230,6 @@ class SelfTrainer:
             self.model.parameters(),
             lr=self.learning_rate
         )
-        # 기존: KL Divergence (Negative term 누락)
-        # 변경: BCEWithLogitsLoss (Soft Target 지원)
-        criterion = nn.BCEWithLogitsLoss(reduction='none')
         
         print(f"\nSelf-Training Iteration {iteration + 1}/{self.num_iterations}")
         
@@ -210,13 +255,15 @@ class SelfTrainer:
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 
-                # Forward pass
-                logits = self.model(input_ids, attention_mask, self.edge_index, return_probs=False)
+                # Forward pass (edge_index is stored as model buffer)
+                # Set return_probs to True to get probabilities for KL divergence
+                actual_model = self.model.module if hasattr(self.model, 'module') else self.model
+                actual_model.set_return_probs(True)
+                predictions = self.model(input_ids, attention_mask)
+                actual_model.set_return_probs(False)
                 
-                # Compute BCEWithLogitsLoss
-                # BCEWithLogitsLoss는 Target이 0과 1 사이의 실수여도 작동함 (Soft Label)
-                loss = criterion(logits, batch_targets)
-                loss = loss.mean()
+                # Compute KL Divergence Loss (as per paper)
+                loss = self.kl_divergence_loss(predictions, batch_targets)
                 
                 # Backward pass
                 optimizer.zero_grad()
@@ -232,12 +279,12 @@ class SelfTrainer:
                 pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             
             avg_loss = total_loss / num_batches
-            print(f"  Epoch {epoch+1} - Avg Loss: {avg_loss:.4f}")
+            print(f"  Epoch {epoch+1} - Avg KL Loss: {avg_loss:.4f}")
             
             # Log to wandb
             if self.use_wandb:
                 wandb.log({
-                    "stage4/self_train_loss": avg_loss,
+                    "stage4/self_train_kl_loss": avg_loss,
                     "stage4/iteration": iteration + 1,
                     "stage4/epoch": epoch + 1,
                 })
@@ -292,8 +339,13 @@ class SelfTrainer:
     def save_model(self, filename: str):
         """Save model checkpoint"""
         save_path = os.path.join(self.save_dir, filename)
+        
+        # Get actual model (unwrap DataParallel if needed)
+        # This ensures state_dict doesn't have 'module.' prefix
+        model_to_save = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+        
         torch.save({
-            'model_state_dict': self.model.state_dict()
+            'model_state_dict': model_to_save.state_dict()
         }, save_path)
         print(f"Saved model to {save_path}")
     
@@ -301,7 +353,13 @@ class SelfTrainer:
         """Load model checkpoint"""
         load_path = os.path.join(self.save_dir, filename)
         checkpoint = torch.load(load_path)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Handle DataParallel: load into underlying model if wrapped
+        if isinstance(self.model, torch.nn.DataParallel):
+            self.model.module.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+        
         print(f"Loaded model from {load_path}")
 
 
