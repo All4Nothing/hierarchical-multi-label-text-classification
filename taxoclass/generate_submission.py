@@ -219,7 +219,6 @@ def predict_classes(
     test_loader: DataLoader,
     edge_index: torch.Tensor,
     device: str,
-    threshold: float = 0.5,
 ) -> np.ndarray:
     """
     Generate predictions for test set
@@ -229,7 +228,6 @@ def predict_classes(
         test_loader: Test data loader
         edge_index: Hierarchy edge index
         device: Device
-        threshold: Probability threshold for binary classification
         
     Returns:
         Probability predictions array (num_samples, num_classes)
@@ -360,7 +358,6 @@ def generate_submission(
         test_loader=test_loader,
         edge_index=edge_index,
         device=device,
-        threshold=threshold,
     )
     
     # Save predictions
