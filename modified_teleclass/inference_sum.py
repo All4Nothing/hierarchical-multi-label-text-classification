@@ -157,8 +157,93 @@ class WeightedMultiLabelDataset(Dataset):
             'attention_mask': encoding['attention_mask'].squeeze(0)
         }
 
+
 # ============================================================================
-# 3. INFERENCE ENGINE
+# 3. OPTIMAL PATH SEARCH LOGIC (Core Algorithm)
+# ============================================================================
+
+def get_paths_to_root(graph, node):
+    """
+    Find all paths from Root to the given Node.
+    Returns: List[List[int]] (e.g., [[root, parent, node]])
+    """
+    paths = []
+    try:
+        # NetworkX predecessors logic (Reverse DFS)
+        preds = list(graph.predecessors(node))
+        if not preds: # Root or isolated
+            return [[node]]
+        
+        for p in preds:
+            parent_paths = get_paths_to_root(graph, p)
+            for path in parent_paths:
+                paths.append(path + [node])
+    except nx.NetworkXError:
+        return [[node]]
+    return paths
+
+def select_optimal_path(probs, graph, top_k=10, min_labels=2, max_labels=3):
+    """
+    Selects the best path chain with length [min_labels, max_labels]
+    based on average probability.
+    """
+    if isinstance(probs, torch.Tensor):
+        probs = probs.detach().cpu().numpy()
+
+    # 1. Select Candidate Anchors (Top-K Probabilities)
+    sorted_indices = np.argsort(probs)[::-1] # Descending
+    anchors = sorted_indices[:top_k]
+    
+    best_path = []
+    best_score = -1.0
+    
+    for anchor in anchors:
+        anchor = int(anchor)
+        if not graph.has_node(anchor): continue
+        
+        # Get all paths from root to this anchor
+        # e.g. [Root, L1, L2, Anchor]
+        full_paths = get_paths_to_root(graph, anchor)
+        
+        for path in full_paths:
+            # Generate all sub-paths (windows) of length [min_labels, max_labels]
+            candidates = []
+            
+            # If path is short, take it all
+            if len(path) < min_labels:
+                candidates.append(path)
+            else:
+                # Sliding Window
+                for length in range(min_labels, max_labels + 1):
+                    if length > len(path): break
+                    for i in range(len(path) - length + 1):
+                        candidates.append(path[i : i + length])
+            
+            # Score each candidate
+            for cand in candidates:
+                # Score = Mean Probability
+                score = np.mean([probs[c] for c in cand])
+                
+                # Update best
+                if score > best_score:
+                    best_score = score
+                    best_path = cand
+    
+    # Safety Fallback: Ensure minimum length
+    final_path = sorted(list(set(best_path)))
+    if len(final_path) < min_labels:
+        # Add highest probability nodes that are not in path
+        for idx in sorted_indices:
+            idx = int(idx)
+            if idx not in final_path:
+                final_path.append(idx)
+                if len(final_path) >= min_labels:
+                    break
+    
+    return sorted(final_path)
+
+# ============================================================================
+# 4. INFERENCE ENGINE
 # ============================================================================
 
 class InferenceEngine:
@@ -205,19 +290,28 @@ class InferenceEngine:
                 
                 preds = (probs > threshold).cpu().numpy()
                 
-                for i, p in enumerate(preds):
+                """for i, p in enumerate(preds):
                     indices = np.where(p)[0].tolist()
                     # Fallback: if no label predicted, pick top-1
                     if not indices:
                         indices = [torch.argmax(probs[i]).item()]
-                    all_preds.append(indices)
+                    all_preds.append(indices)"""
+                for doc_probs in probs:
+                    optimized_path = select_optimal_path(
+                        doc_probs, 
+                        self.hierarchy_graph, 
+                        top_k=10, 
+                        min_labels=2, 
+                        max_labels=3
+                    )
+                    all_preds.append(optimized_path)
         return all_preds
 
     def save_submission(self, predictions, ids, output_path):
         logger.info(f"Saving submission to {output_path}")
         data = []
         for doc_id, label_indices in zip(ids, predictions):
-            label_str = " ".join(map(str, label_indices))
+            label_str = ",".join(map(str, label_indices))
             data.append({'id': doc_id, 'labels': label_str})
             
         df = pd.DataFrame(data)
@@ -234,7 +328,7 @@ if __name__ == "__main__":
     # Settings
     DATA_DIR = "../Amazon_products"  # Adjust if needed
     MODEL_DIR = "outputs/models/best_model"
-    OUTPUT_FILE = "outputs/submission_final.csv"
+    OUTPUT_FILE = "outputs/submission_2.csv"
     
     if not os.path.exists(DATA_DIR):
         if os.path.exists(f"../{DATA_DIR}"): DATA_DIR = f"../{DATA_DIR}"
@@ -252,7 +346,7 @@ if __name__ == "__main__":
     )
     
     # 3. Predict
-    raw_preds = engine.predict(loader.test_corpus, batch_size=128, threshold=0.9)
+    raw_preds = engine.predict(loader.test_corpus, batch_size=128, threshold=0.5)
     
     # 4. Expand Hierarchy (Child -> Parent)
     expander = HierarchyExpander(loader.hierarchy_graph)

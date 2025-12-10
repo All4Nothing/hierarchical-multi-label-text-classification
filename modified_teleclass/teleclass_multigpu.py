@@ -221,11 +221,11 @@ def generate_bert_class_embeddings(model_name, class_list, device):
 # ============================================================================
 
 class TELEClassTrainer:
-    def __init__(self, num_classes, model_name, class_embeddings, device_ids=None):
+    def __init__(self, num_classes, model_name, hidden_dim, class_embeddings, device_ids=None):
         self.available_gpus = device_ids if device_ids else list(range(torch.cuda.device_count()))
         self.primary_device = f'cuda:{self.available_gpus[0]}' if self.available_gpus else 'cpu'
-        
-        self.model = ClassModel(model_name, 768, class_embeddings)
+        self.hidden_dim = hidden_dim
+        self.model = ClassModel(model_name, self.hidden_dim, class_embeddings)
         self.model.to(self.primary_device)
         
         if len(self.available_gpus) > 1:
@@ -865,9 +865,13 @@ class MultiGPUTELEClassPipeline:
         logger.info(f"Augmentation Scaling Factor: {aug_scaling:.4f}")
 
         # 4. Initialize Trainer
+        model_name="bert-base-uncased",
+        config = AutoConfig.from_pretrained(model_name)
+        
         trainer = TELEClassTrainer(
             num_classes=len(data_loader.all_classes),
-            model_name="bert-base-uncased",
+            hidden_dim=config.hidden_size,
+            model_name=model_name,
             class_embeddings=bert_class_embeddings, # [중요] BERT 임베딩 전달
             device_ids=self.device_ids
         )
