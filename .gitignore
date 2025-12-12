@@ -62,3 +62,14 @@ wandb/
 
 taxoclass/saved_models/
 modified_teleclass/outputs/
+
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local

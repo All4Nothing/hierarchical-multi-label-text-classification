@@ -19,6 +19,24 @@ os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['USE_TF'] = 'NO'
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Fix tokenizer warning
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Try to load .env file from the script's directory or parent directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(script_dir, '.env')
+    if not os.path.exists(env_path):
+        # Try parent directory
+        env_path = os.path.join(os.path.dirname(script_dir), '.env')
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+        print(f"Loaded .env file from: {env_path}")
+except ImportError:
+    # dotenv not installed, skip loading .env file
+    print("Warning: python-dotenv not installed. Install it with: pip install python-dotenv")
+except Exception as e:
+    print(f"Warning: Could not load .env file: {e}")
+
 import random
 import numpy as np
 import torch
@@ -28,7 +46,7 @@ from torch.nn.parallel import DataParallel
 from torch.utils.data import Dataset, DataLoader as TorchDataLoader
 from torch.optim import AdamW
 
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoConfig
 from sentence_transformers import SentenceTransformer
 import pandas as pd
 import networkx as nx
@@ -36,6 +54,8 @@ from typing import List, Dict, Tuple, Set, Optional
 from tqdm import tqdm
 import json
 import logging
+import openai
+from sklearn.model_selection import train_test_split
 
 # Setup logging
 logging.basicConfig(
@@ -80,42 +100,49 @@ logger = logging.getLogger(__name__)
 # AUTHOR'S MODEL ARCHITECTURE (From model.py)
 # ============================================================================
 
-class LBM(nn.Module):
-    """Log-Bilinear Model Layer for Interaction"""
-    def __init__(self, l_dim, r_dim, n_classes=None, bias=True):
-        super(LBM, self).__init__()
-        self.weight = Parameter(torch.Tensor(l_dim, r_dim))
-        self.use_bias = bias
-        if self.use_bias:
-            self.bias = Parameter(torch.Tensor(n_classes))
-        
-        bound = 1.0 / math.sqrt(l_dim)
-        init.uniform_(self.weight, -bound, bound)
-        if self.use_bias:
-            init.uniform_(self.bias, -bound, bound)
-
-    def forward(self, e1, e2):
-        scores = torch.matmul(torch.matmul(e1, self.weight), e2.T)
-        if self.use_bias:
-            scores = scores + self.bias
-        return scores
-
 class ClassModel(nn.Module):
-    def __init__(self, encoder_name, enc_dim, class_embeddings):
+    def __init__(self, encoder_name, enc_dim, class_embeddings, temperature=0.07):
         super(ClassModel, self).__init__()
         self.doc_encoder = AutoModel.from_pretrained(encoder_name)
         self.doc_dim = enc_dim
+
+        self.temperature = temperature
         
         self.num_classes, self.label_dim = class_embeddings.size()
         # [중요] BERT 공간에 맞춰진 임베딩을 파라미터로 등록
         self.label_embedding_weights = nn.Parameter(class_embeddings.clone(), requires_grad=True)
         
-        self.interaction = LBM(self.doc_dim, self.label_dim, n_classes=self.num_classes, bias=False)
-
+    def mean_pooling(self, model_output, attention_mask):
+        """
+        MPNet(SBERT) Standard Pooling Strategy
+        """
+        token_embeddings = model_output.last_hidden_state
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, dim=1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
+        return sum_embeddings / sum_mask
+    
     def forward(self, input_ids, attention_mask):
+        # 1. Document Encoding (MPNet)
         outputs = self.doc_encoder(input_ids, attention_mask=attention_mask)
-        doc_tensor = outputs[1] # Pooler output
-        scores = self.interaction(doc_tensor, self.label_embedding_weights)
+        
+        # 2. Mean Pooling (Crucial for MPNet)
+        doc_vector = self.mean_pooling(outputs, attention_mask) # [Batch, 768]
+        
+        # 3. Normalization (Crucial for preventing Logit Explosion)
+        # MPNet은 Cosine Similarity 공간에서 학습되었으므로 정규화가 필수입니다.
+        doc_norm = F.normalize(doc_vector, p=2, dim=1)
+        label_norm = F.normalize(self.label_embedding_weights, p=2, dim=1)
+        
+        # 4. Simple Dot Product (Cosine Similarity)
+        # LBM 없이 직접 내적합니다.
+        # 수식: Score = (Doc / |Doc|) * (Label / |Label|)^T
+        scores = torch.matmul(doc_norm, label_norm.T) # [Batch, Num_Classes]
+        
+        # 5. Temperature Scaling
+        # Cosine Sim(-1~1)을 Sigmoid에 적합한 범위(예: -14~14)로 확장
+        scores = scores / self.temperature
+        
         return scores
 
 def multilabel_bce_loss_w(output, target, weight=None):
@@ -169,18 +196,20 @@ class WeightedMultiLabelDataset(Dataset):
         
         if is_aug:
             # [Author's Logic] Augmented data gets a uniform scaling weight
-            mask = mask * self.augmentation_scaling
+            # augmentation_scaling이 리스트인 경우 해당 샘플의 값을 사용
+            scaling_value = self.augmentation_scaling[idx] if isinstance(self.augmentation_scaling, (list, tuple, np.ndarray)) else self.augmentation_scaling
+            mask = mask * scaling_value
         else:
             # [Author's Logic] Real data: Mask out descendants of positive classes
             # (Ambiguous: If parent is true, child might be true or false, so don't penalize)
+            mask[label_indices] *= 2.0 # 10.0 -> 2.0
+            
             for pos_cls in label_indices:
                 descendants = self.descendants_cache.get(pos_cls, set())
                 for desc in descendants:
                     if desc not in label_indices:
                         mask[desc] = 0.0
             
-            # [Custom Fix] Pos Weight to handle imbalance (Optional but recommended)
-            mask[label_indices] *= 10.0
             
         return {
             'input_ids': encoding['input_ids'].squeeze(0),
@@ -192,40 +221,60 @@ class WeightedMultiLabelDataset(Dataset):
 # ============================================================================
 # HELPER: Generate BERT embeddings for Class Names
 # ============================================================================
-def generate_bert_class_embeddings(model_name, class_list, device):
+def generate_bert_class_embeddings(model_name, class_list, class_descriptions, device):
     """
     Generates class embeddings using the SAME backbone as the classifier.
     Matches logic in prepare_training_data.py
     """
-    logger.info(f"Generating class embeddings using {model_name} (for compatibility)...")
+    # logger.info(f"Generating class embeddings using {model_name} (for compatibility)...")
+    logger.info(f"Generating class embeddings using {model_name} with LLM Descriptions...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name).to(device)
     model.eval()
     
+    texts_to_encode = []
+    for cls_name in class_list:
+        if class_descriptions and cls_name in class_descriptions:
+            # LLM 설명 사용
+            desc = class_descriptions[cls_name]
+            # (옵션) 키워드 부분 제거하고 설명만 쓸지, 통째로 쓸지 결정. 통째로 추천.
+            texts_to_encode.append(desc) 
+        else:
+            # Fallback
+            texts_to_encode.append(f"The product category is {cls_name.replace('_', ' ')}")
+
     class_emb = []
+    batch_size = 64
     with torch.no_grad():
-        for cls_name in tqdm(class_list, desc="Encoding Classes"):
-            # Authors replace underscores with spaces
-            inputs = tokenizer(cls_name.replace('_', ' '), return_tensors="pt").to(device)
+        for i in range(0, len(texts_to_encode), batch_size):
+            batch_texts = texts_to_encode[i : i + batch_size]
+            inputs = tokenizer(batch_texts, padding=True, truncation=True, max_length=128, return_tensors="pt").to(device)
             outputs = model(**inputs)
-            # Use average of last hidden state (excluding [CLS], [SEP])
-            # output[0] is last_hidden_state: (batch, seq_len, dim)
-            # 1:-1 removes special tokens
-            emb = outputs.last_hidden_state[0, 1:-1].mean(dim=0).cpu()
-            class_emb.append(emb)
             
-    return torch.stack(class_emb)
+            # [CLS] 토큰 사용 (설명이 길어진 경우 Mean보다 CLS가 나을 수 있음, 혹은 Mean 유지)
+            # 여기서는 DeBERTa/BERT 특성상 CLS 혹은 Mean 사용. 작성자 코드는 Mean 사용.
+            # outputs.last_hidden_state: (batch, seq, dim)
+            # Attention Mask를 고려한 Mean Pooling 적용
+            mask = inputs['attention_mask'].unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
+            masked_embeddings = outputs.last_hidden_state * mask
+            sum_embeddings = torch.sum(masked_embeddings, dim=1)
+            sum_mask = torch.clamp(mask.sum(1), min=1e-9)
+            mean_embeddings = sum_embeddings / sum_mask
+            
+            class_emb.append(mean_embeddings.cpu())
+            
+    return torch.cat(class_emb, dim=0)
 
 # ============================================================================
 # TRAINER CLASS
 # ============================================================================
 
 class TELEClassTrainer:
-    def __init__(self, num_classes, model_name, hidden_dim, class_embeddings, device_ids=None):
+    def __init__(self, num_classes, model_name, hidden_dim, class_embeddings, temperature=0.07, device_ids=None):
         self.available_gpus = device_ids if device_ids else list(range(torch.cuda.device_count()))
         self.primary_device = f'cuda:{self.available_gpus[0]}' if self.available_gpus else 'cpu'
         self.hidden_dim = hidden_dim
-        self.model = ClassModel(model_name, self.hidden_dim, class_embeddings)
+        self.model = ClassModel(model_name, self.hidden_dim, class_embeddings, temperature=0.07)
         self.model.to(self.primary_device)
         
         if len(self.available_gpus) > 1:
@@ -235,16 +284,47 @@ class TELEClassTrainer:
         self.num_classes = num_classes
 
     def train(self, train_texts, train_labels, is_augmented_mask, aug_scaling, 
-              hierarchy_graph, epochs=5, lr=5e-5, batch_size=16, output_dir="outputs"):
+              hierarchy_graph, epochs=20, lr=2e-5, batch_size=16, output_dir="outputs", val_split=0.1, patience=5, save_interval=5):
         
         eff_batch_size = batch_size * max(1, len(self.available_gpus))
         
-        dataset = WeightedMultiLabelDataset(
+        """dataset = WeightedMultiLabelDataset(
             train_texts, train_labels, self.tokenizer, hierarchy_graph, self.num_classes,
             is_augmented_mask=is_augmented_mask, augmentation_scaling=aug_scaling
         )
         dataloader = TorchDataLoader(dataset, batch_size=eff_batch_size, shuffle=True, num_workers=4)
+        """
+        # 1. Validation Split (데이터 분리)
+        # Stratified Split을 하면 좋지만, Multi-label이므로 단순 Random Split 사용
+        # 입력 데이터 리스트들을 함께 분리하기 위해 zip으로 묶었다가 품
+        logger.info(f"Splitting data: {1.0-val_split:.0%} Train, {val_split:.0%} Validation")
         
+        # aug_scaling이 None이거나 스칼라인 경우 리스트로 변환
+        if aug_scaling is None:
+            aug_scaling = [1.0] * len(train_texts)
+        elif not isinstance(aug_scaling, (list, tuple, np.ndarray)):
+            # 스칼라 값인 경우 리스트로 변환
+            aug_scaling = [aug_scaling] * len(train_texts)
+
+        # 데이터 분리
+        tr_texts, val_texts, tr_labels, val_labels, tr_mask, val_mask, tr_scale, val_scale = train_test_split(
+            train_texts, train_labels, is_augmented_mask, aug_scaling, 
+            test_size=val_split, random_state=42
+        )
+
+        # 2. Dataset & DataLoader 생성
+        train_dataset = WeightedMultiLabelDataset(
+            tr_texts, tr_labels, self.tokenizer, hierarchy_graph, self.num_classes,
+            is_augmented_mask=tr_mask, augmentation_scaling=tr_scale
+        )
+        val_dataset = WeightedMultiLabelDataset(
+            val_texts, val_labels, self.tokenizer, hierarchy_graph, self.num_classes,
+            is_augmented_mask=val_mask, augmentation_scaling=val_scale
+        )
+
+        train_loader = TorchDataLoader(train_dataset, batch_size=eff_batch_size, shuffle=True, num_workers=4)
+        val_loader = TorchDataLoader(val_dataset, batch_size=eff_batch_size, shuffle=False, num_workers=4)
+
         # Author's Optimizer Settings
         no_decay = ["bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
@@ -254,9 +334,12 @@ class TELEClassTrainer:
         optimizer = AdamW(optimizer_grouped_parameters, lr=lr, eps=1e-8)
         
         self.model.train()
+        best_val_loss = float('inf')
+        patience_counter = 0
+
         for epoch in range(epochs):
             total_loss = 0
-            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
             
             for batch in pbar:
                 input_ids = batch['input_ids'].to(self.primary_device)
@@ -274,9 +357,44 @@ class TELEClassTrainer:
                 total_loss += loss.item()
                 pbar.set_postfix({'loss': loss.item()})
             
-            # Save Checkpoint
-            if (epoch + 1) == epochs:
+            avg_train_loss = total_loss / len(train_loader)
+
+            # Validation
+            self.model.eval()
+            total_val_loss = 0
+            with torch.no_grad():
+                for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
+                    input_ids = batch['input_ids'].to(self.primary_device)
+                    attention_mask = batch['attention_mask'].to(self.primary_device)
+                    labels = batch['labels'].to(self.primary_device)
+                    sample_mask = batch['sample_mask'].to(self.primary_device) # Val에서는 보통 weight 1.0이지만 형식 유지
+                    
+                    outputs = self.model(input_ids, attention_mask)
+                    loss = multilabel_bce_loss_w(outputs, labels, sample_mask)
+                    total_val_loss += loss.item()
+
+            avg_val_loss = total_val_loss / len(val_loader)
+            logger.info(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+                logger.info(f"New Best Val Loss! Saving best model to {output_dir}/best_model")
                 self.save_model(os.path.join(output_dir, "best_model"))
+            else:
+                patience_counter += 1
+                logger.info(f"Patience {patience_counter}/{patience} - No improvement")
+
+            # Save Checkpoint
+            if (epoch + 1) % save_interval == 0:
+                self.save_model(os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}"))
+                logger.info(f"Saved checkpoint to {output_dir}/checkpoint_epoch_{epoch+1}")
+
+            if patience_counter >= patience:
+                logger.info(f"Early stopping triggered after {patience} epochs without improvement")
+                break
+            
+        logger.info(f"Training complete. Best Val Loss: {best_val_loss:.4f}")
 
     def save_model(self, path):
         os.makedirs(path, exist_ok=True)
@@ -327,8 +445,7 @@ class CustomInference:
         logger.info(f"Generating submission file: {output_path}")
         submission_data = []
         for doc_id, label_indices in enumerate(predictions):
-            # Format: id, labels ("0 5 10")
-            label_str = " ".join([str(idx) for idx in label_indices])
+            label_str = ",".join(map(str, label_indices))
             submission_data.append({'id': doc_id, 'labels': label_str})
 
         df = pd.DataFrame(submission_data)
@@ -471,8 +588,9 @@ class MultiGPUClassRepresentation:
     """
     
     def __init__(self, model_name: str = "sentence-transformers/all-mpnet-base-v2", 
-                 device_ids: Optional[List[int]] = None):
+                 device_ids: Optional[List[int]] = None, output_dir: str = "outputs"):
         self.available_gpus = get_available_gpus()
+        self.output_dir = output_dir
         
         if not self.available_gpus:
             logger.warning("No GPUs available, using CPU")
@@ -494,13 +612,110 @@ class MultiGPUClassRepresentation:
         
         self.model.to(self.primary_device)
         
-    def create_class_descriptions(self, class_keywords: Dict[str, List[str]]) -> Dict[str, str]:
-        """Create natural language descriptions for each class."""
+        # Initialize OpenAI client with API key from environment variable
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
+            self.openai_client = openai.OpenAI(api_key=api_key)
+        else:
+            logger.warning("OPENAI_API_KEY not found in environment variables. LLM features may not work.")
+            self.openai_client = None
+    
+    def _call_llm_api(self, prompt: str) -> str:
+        """
+        Call OpenAI API to generate a class description.
+        """
+        if self.openai_client is None:
+            logger.error("OpenAI client not initialized. Please set OPENAI_API_KEY environment variable.")
+            return ""
+        
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=200
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Error calling OpenAI API: {e}")
+            return ""
+        
+        
+
+    def create_enriched_class_descriptions(self, class_keywords, hierarchy_graph, idx_to_class):
+        """
+        Generates context-aware class descriptions using LLM with Hierarchy info.
+        """
+        logger.info("Generating enriched class descriptions via LLM...")
         descriptions = {}
-        for class_name, keywords in class_keywords.items():
+        
+        cache_file = os.path.join(self.output_dir, "enriched_class_descriptions.json")
+
+        if os.path.exists(cache_file):
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                descriptions = json.load(f)
+            logger.info(f"Loaded {len(descriptions)} cached descriptions")
+            return descriptions
+
+        # 그래프 탐색을 위해 이름을 ID로 매핑하는 역방향 딕셔너리 생성 (필요시)
+        class_to_idx = {v: k for k, v in idx_to_class.items()}
+
+        cnt = 0
+        save_interval = 50
+        for class_name, keywords in tqdm(class_keywords.items(), desc="LLM Enrichment"):
+            # 1. Context Retrieval (Hierarchy)
+            cid = class_to_idx.get(class_name)
+            parent_name = "None"
+            siblings = []
+            
+            if cid is not None and hierarchy_graph.has_node(cid):
+                # Find Parent
+                preds = list(hierarchy_graph.predecessors(cid))
+                if preds:
+                    parent_id = preds[0] # Tree 구조 가정
+                    parent_name = idx_to_class.get(parent_id, "Unknown")
+                    
+                    # Find Siblings (Children of the same parent, excluding self)
+                    siblings_ids = list(hierarchy_graph.successors(parent_id))
+                    siblings = [idx_to_class[s] for s in siblings_ids if s != cid]
+            
+            # 2. Prompt Engineering (The 'Profile' Strategy)
+            sibling_str = ", ".join(siblings[:3]) if siblings else "None" # 너무 많으면 3개만
             keyword_str = ", ".join(keywords)
-            description = f"The product category is {class_name}, associated with keywords: {keyword_str}"
-            descriptions[class_name] = description
+            
+            prompt = f"""
+            Task: Define the Amazon product category '{class_name}'.
+            Context:
+            - Parent Category: {parent_name}
+            - Sibling Categories (Distinct from): {sibling_str}
+            - Associated Keywords: {keyword_str}
+            
+            Write a sharp, 1-sentence definition focusing on visual/functional attributes 
+            that distinguish '{class_name}' from its siblings. 
+            Do NOT mention the class name directly in the beginning.
+            """
+            
+            # 3. LLM Generation
+            llm_desc = self._call_llm_api(prompt)
+
+            if not llm_desc:
+                logger.warning(f"Failed to generate description for {class_name}, using keywords only")
+            
+            
+            # 4. Residual Connection (Safety Net)
+            # LLM이 헛소리를 할 경우를 대비해 원래 키워드를 뒤에 붙임
+            final_desc = f"Class Name: {class_name} ; Keywords: {keyword_str} ; Description: {llm_desc}"
+            descriptions[class_name] = final_desc
+
+            cnt += 1
+            if cnt % save_interval == 0:
+                with open(cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(descriptions, f, indent=2, ensure_ascii=False)
+                logger.info(f"Saved {len(descriptions)} enriched descriptions to {cache_file}")
+        
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(descriptions, f, indent=2, ensure_ascii=False)
+        logger.info(f"Saved {len(descriptions)} enriched descriptions to {cache_file}")
         return descriptions
     
     def encode_classes(self, class_descriptions: Dict[str, str], all_classes: List[str]) -> torch.Tensor:
@@ -508,14 +723,13 @@ class MultiGPUClassRepresentation:
         logger.info("Encoding class descriptions...")
         descriptions_list = [class_descriptions.get(cls, f"The product category is {cls}") 
                             for cls in all_classes]
-        
         # Use multi-GPU encoding
         embeddings = self.model.encode(
             descriptions_list,
             convert_to_tensor=True,
             show_progress_bar=True,
             device=self.primary_device,
-            batch_size=32
+            batch_size=64
         )
         return embeddings
     
@@ -778,8 +992,14 @@ class MultiGPUTELEClassPipeline:
         logger.info("\n" + "="*80)
         logger.info("PHASE 1: MULTI-GPU CLASS REPRESENTATION")
         logger.info("="*80)
-        class_repr = MultiGPUClassRepresentation(device_ids=self.device_ids)
-        class_descriptions = class_repr.create_class_descriptions(data_loader.class_keywords)
+        class_repr = MultiGPUClassRepresentation(device_ids=self.device_ids, output_dir=self.output_dir)
+        
+        class_descriptions = class_repr.create_enriched_class_descriptions(
+            class_keywords=data_loader.class_keywords,
+            hierarchy_graph=data_loader.hierarchy_graph,
+            idx_to_class=data_loader.idx_to_class
+        )
+
         class_embeddings = class_repr.encode_classes(class_descriptions, data_loader.all_classes)
         doc_embeddings = class_repr.encode_documents_parallel(data_loader.all_corpus, batch_size=64)
         
@@ -846,7 +1066,7 @@ class MultiGPUTELEClassPipeline:
         # Phase 2(MPNet) 결과는 버리고, BERT 공간에서 새로 만듭니다.
         primary_device = f'cuda:{self.device_ids[0]}' if self.device_ids else 'cpu'
         bert_class_embeddings = generate_bert_class_embeddings(
-            "bert-base-uncased", data_loader.all_classes, primary_device
+            "bert-base-uncased", data_loader.all_classes, class_descriptions, primary_device
         )
         
         # 2. Prepare Data (All Corpus + Augmentation)
@@ -865,7 +1085,7 @@ class MultiGPUTELEClassPipeline:
         logger.info(f"Augmentation Scaling Factor: {aug_scaling:.4f}")
 
         # 4. Initialize Trainer
-        model_name="bert-base-uncased",
+        model_name="bert-base-uncased"
         config = AutoConfig.from_pretrained(model_name)
         
         trainer = TELEClassTrainer(
@@ -873,7 +1093,8 @@ class MultiGPUTELEClassPipeline:
             hidden_dim=config.hidden_size,
             model_name=model_name,
             class_embeddings=bert_class_embeddings, # [중요] BERT 임베딩 전달
-            device_ids=self.device_ids
+            device_ids=self.device_ids,
+            temperature=0.07
         )
         
         # 5. Train
@@ -883,13 +1104,13 @@ class MultiGPUTELEClassPipeline:
             is_augmented_mask,
             aug_scaling,
             data_loader.hierarchy_graph,
-            epochs=5,
-            lr=5e-5,
+            epochs=20,
+            lr=2e-5,
             output_dir=os.path.join(self.output_dir, "models")
         )
         
         # 6. Inference
-        logger.info("PHASE 6: CUSTOM MODEL INFERENCE")
+        """logger.info("PHASE 6: CUSTOM MODEL INFERENCE")
         inference = CustomInference(
             os.path.join(self.output_dir, "models", "best_model"),
             bert_class_embeddings, # Inference 때도 구조 초기화를 위해 필요
@@ -909,7 +1130,7 @@ class MultiGPUTELEClassPipeline:
             test_predictions_expanded,
             data_loader.idx_to_class,
             output_path=os.path.join(self.output_dir, "submission.csv")
-        )
+        )"""
         
         logger.info("\n" + "="*80)
         logger.info("MULTI-GPU PIPELINE COMPLETE!")

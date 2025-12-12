@@ -1,9 +1,9 @@
 """
-TELEClass Inference-Only Script
+TELEClass Inference-Only Script (DeBERTa Compatible)
 Loads a trained model and generates Kaggle submission.
 """
 
-import math # Missing import fix
+import math
 import os
 import torch
 import torch.nn as nn
@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from torch.nn import init
 from torch.utils.data import Dataset, DataLoader as TorchDataLoader
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoConfig, DebertaV2Tokenizer
 import pandas as pd
 import networkx as nx
 import numpy as np
@@ -26,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# 1. MODEL ARCHITECTURE (Must match training)
+# 1. MODEL ARCHITECTURE (Must match teleclass_deberta.py)
 # ============================================================================
 
 class LBM(nn.Module):
@@ -48,23 +48,24 @@ class LBM(nn.Module):
         return scores
 
 class ClassModel(nn.Module):
-    def __init__(self, encoder_name, enc_dim, class_embeddings):
+    def __init__(self, config_or_name, enc_dim, class_embeddings):
         super(ClassModel, self).__init__()
-        self.doc_encoder = AutoModel.from_pretrained(encoder_name)
+
+        if isinstance(config_or_name, str):
+            self.doc_encoder = AutoModel.from_pretrained(config_or_name)
+        else:
+            self.doc_encoder = AutoModel.from_config(config_or_name)
         self.doc_dim = enc_dim
         
         self.num_classes, self.label_dim = class_embeddings.size()
-        # Initialize with provided embeddings (will be overwritten by load_state_dict)
         self.label_embedding_weights = nn.Parameter(class_embeddings.clone(), requires_grad=True)
-        
         self.interaction = LBM(self.doc_dim, self.label_dim, n_classes=self.num_classes, bias=False)
 
     def forward(self, input_ids, attention_mask):
         outputs = self.doc_encoder(input_ids, attention_mask=attention_mask)
-        doc_tensor = outputs[1] # Pooler output
+        doc_tensor = outputs.last_hidden_state[:, 0, :]
         scores = self.interaction(doc_tensor, self.label_embedding_weights)
         return scores
-
 # ============================================================================
 # 2. UTILS & DATA LOADING
 # ============================================================================
@@ -135,10 +136,8 @@ class WeightedMultiLabelDataset(Dataset):
         self.num_classes = num_classes
         self.max_length = max_length
         
-        # Precompute descendants (Required to avoid KeyError 0)
         self.descendants_cache = {}
         for node in range(num_classes):
-            # Safe access for graph nodes
             if hierarchy_graph.has_node(node):
                 self.descendants_cache[node] = nx.descendants(hierarchy_graph, node)
             else:
@@ -157,10 +156,55 @@ class WeightedMultiLabelDataset(Dataset):
             'attention_mask': encoding['attention_mask'].squeeze(0)
         }
 
+# ============================================================================
+# 3. PATH SEARCH LOGIC
+# ============================================================================
 
-# ============================================================================
-# 3. OPTIMAL PATH SEARCH LOGIC (Core Algorithm)
-# ============================================================================
+def select_top_down_beam(probs, graph, beam_width=5, min_labels=2, max_labels=3):
+    """Top-Down Beam Search Strategy"""
+    if isinstance(probs, torch.Tensor):
+        probs = probs.detach().cpu().numpy()
+
+    roots = [n for n in graph.nodes() if graph.in_degree(n) == 0]
+    
+    beam = []
+    for r in roots:
+        if r < len(probs):
+            score = probs[r]
+            beam.append((score, [r]))
+    
+    beam = sorted(beam, key=lambda x: x[0], reverse=True)[:beam_width]
+    completed_paths = [] 
+
+    for _ in range(max_labels - 1):
+        candidates = []
+        for score, path in beam:
+            curr_node = path[-1]
+            if min_labels <= len(path) <= max_labels:
+                completed_paths.append((score, path))
+            
+            children = list(graph.successors(curr_node))
+            if not children: continue
+                
+            for child in children:
+                if child >= len(probs): continue
+                new_score = score * probs[child]
+                new_path = path + [child]
+                candidates.append((new_score, new_path))
+        
+        if not candidates: break
+        beam = sorted(candidates, key=lambda x: x[0], reverse=True)[:beam_width]
+    
+    completed_paths.extend(beam)
+    
+    valid_paths = [(s, p) for s, p in completed_paths if min_labels <= len(p) <= max_labels]
+    
+    if not valid_paths:
+        return [int(np.argmax(probs))]
+    
+    alpha = 2 # larger alpha -> more weight on length
+    best_path = sorted(valid_paths, key=lambda x: math.pow(x[0], 1.0 / (len(x[1]) ** alpha)), reverse=True)[0][1]
+    return sorted(best_path)
 
 def get_paths_to_root(graph, node):
     """
@@ -181,6 +225,78 @@ def get_paths_to_root(graph, node):
     except nx.NetworkXError:
         return [[node]]
     return paths
+
+def select_leaf_priority(probs, graph, min_labels=2, max_labels=3):
+    """
+    Leaf-Priority Search (Strict Tree Version)
+    - 가정: 모든 노드는 최대 1개의 부모만 가진다 (Tree 구조).
+    - 로직: 가장 확률 높은 Leaf를 선택하고, 외길인 부모를 타고 올라간다.
+    """
+    if isinstance(probs, torch.Tensor):
+        probs = probs.detach().cpu().numpy()
+
+    # 1. Leaf 노드 식별 (자식이 없는 노드)
+    # 전체 노드 탐색 비용을 줄이기 위해 캐싱하면 좋으나, 여기서는 안전하게 매번 계산
+    leaves = [n for n in graph.nodes() if graph.out_degree(n) == 0]
+    
+    # 유효한 인덱스만 필터링 (probs 범위 내)
+    leaves = [l for l in leaves if l < len(probs)]
+    
+    if not leaves:
+        # Fallback: 리프가 없으면(고립 노드 등) 전체 중 1등 반환
+        return [int(np.argmax(probs))]
+
+    # 2. Best Leaf 선택 (가장 강력한 신호)
+    leaf_probs = probs[leaves]
+    best_leaf = leaves[np.argmax(leaf_probs)]
+    
+    # 3. 경로 재구성 (Bottom-up Traversal)
+    # 트리 구조이므로 부모는 무조건 0개(루트) 아니면 1개입니다.
+    path = [best_leaf]
+    curr = best_leaf
+    
+    while True:
+        try:
+            preds = list(graph.predecessors(curr))
+            if not preds:
+                # print(f"!!!! no predecessors: {path}")
+                break # 루트 도달 (부모 없음)
+            
+            # [Tree Constraint] 부모는 오직 하나
+            parent = preds[0]
+            
+            # Cycle 방지 (데이터 무결성 보호)
+            if parent in path:
+                print(f"!!!! cycle detected: {path}")
+                break
+                
+            path.append(parent)
+            curr = parent
+            
+            # [Safety Check] 계층 깊이가 3이므로, 경로가 3에 도달하면 즉시 중단
+            # (만약 4개가 되면 데이터 오류지만, 코드는 안전하게 3개까지만 취함)
+            if len(path) > max_labels:
+                print(f"!!!! path over depth: {path}")
+                break
+        except:
+            break
+            
+    # 현재 순서: [Leaf, Parent, Root] -> 뒤집어서 [Root, Parent, Leaf]
+    final_path = path[::-1]
+    
+    # 4. 최소 길이 보정 (Padding)
+    # 만약 Root 노드 하나만 예측되어 길이가 2 미만인 경우 (min_labels=2)
+    if len(final_path) < min_labels:
+        print(f"!!!! final_path under min_labels: {final_path}")
+        sorted_indices = np.argsort(probs)[::-1]
+        for idx in sorted_indices:
+            idx = int(idx)
+            if idx not in final_path:
+                final_path.append(idx)
+                if len(final_path) >= min_labels:
+                    break
+    
+    return sorted(final_path)
 
 def select_optimal_path(probs, graph, top_k=10, min_labels=2, max_labels=3):
     """
@@ -258,27 +374,32 @@ class InferenceEngine:
             
         logger.info(f"Loading model architecture and weights from {model_dir}...")
         
-        # 1. Initialize Structure with Dummy Embeddings 
-        # (Real weights will be loaded via load_state_dict)
-        dummy_embeddings = torch.zeros(num_classes, 768)
-        self.model = ClassModel("bert-base-uncased", 768, dummy_embeddings)
+
+        config = AutoConfig.from_pretrained(model_dir)
+        hidden_dim = config.hidden_size
+        logger.info(f"Detected Config Hidden Dim: {hidden_dim}")
+
+
+        # [FIX] 2. Initialize with dynamic dimension
+        dummy_embeddings = torch.zeros(num_classes, hidden_dim)
+        self.model = ClassModel(config, hidden_dim, dummy_embeddings) # model_dir acts as encoder_name
         
-        # 2. Load Trained Weights
+        # 3. Load Trained Weights
         state_dict = torch.load(model_path, map_location=self.device)
         self.model.load_state_dict(state_dict)
         self.model.to(self.device)
         self.model.eval()
         
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        self.tokenizer = DebertaV2Tokenizer.from_pretrained("microsoft/deberta-v3-large")
 
-    def predict(self, texts, batch_size=64, threshold=0.15):
+    def predict(self, texts, batch_size=64, method="top_down_beam"):
         dataset = WeightedMultiLabelDataset(
             texts, self.tokenizer, self.hierarchy_graph, self.num_classes
         )
         dataloader = TorchDataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
         
         all_preds = []
-        logger.info(f"Starting Inference with Threshold {threshold}...")
+        logger.info(f"Starting Inference with Top-Down Beam Search...")
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Inference"):
@@ -286,25 +407,26 @@ class InferenceEngine:
                 attention_mask = batch['attention_mask'].to(self.device)
                 
                 outputs = self.model(input_ids, attention_mask)
-                probs = torch.sigmoid(outputs)
+                probs = torch.sigmoid(outputs).cpu().numpy()
                 
-                preds = (probs > threshold).cpu().numpy()
-                
-                """for i, p in enumerate(preds):
-                    indices = np.where(p)[0].tolist()
-                    # Fallback: if no label predicted, pick top-1
-                    if not indices:
-                        indices = [torch.argmax(probs[i]).item()]
-                    all_preds.append(indices)"""
                 for doc_probs in probs:
-                    optimized_path = select_optimal_path(
-                        doc_probs, 
-                        self.hierarchy_graph, 
-                        top_k=10, 
-                        min_labels=2, 
-                        max_labels=3
-                    )
-                    all_preds.append(optimized_path)
+                    # Apply Top-Down Beam Search
+                    if method == "top_down_beam":
+                        path = select_top_down_beam(
+                            doc_probs, self.hierarchy_graph, beam_width=10,
+                            min_labels=2, max_labels=3
+                        )
+                    elif method == "leaf_priority":
+                        path = select_leaf_priority(
+                            doc_probs, self.hierarchy_graph, min_labels=2, max_labels=3
+                        )
+                    elif method == "optimal_path":
+                        path = select_optimal_path(
+                            doc_probs, self.hierarchy_graph, top_k=10, min_labels=2, max_labels=3
+                        )
+                    else:
+                        raise ValueError(f"Invalid method: {method}")
+                    all_preds.append(path)
         return all_preds
 
     def save_submission(self, predictions, ids, output_path):
@@ -316,8 +438,7 @@ class InferenceEngine:
             
         df = pd.DataFrame(data)
         df.to_csv(output_path, index=False)
-        
-        avg_len = df['labels'].apply(lambda x: len(x.split())).mean()
+        avg_len = df['labels'].apply(lambda x: len(x.split(','))).mean()
         logger.info(f"Submission Stats: Average Labels per Doc = {avg_len:.2f}")
 
 # ============================================================================
@@ -326,13 +447,16 @@ class InferenceEngine:
 
 if __name__ == "__main__":
     # Settings
-    DATA_DIR = "../Amazon_products"  # Adjust if needed
-    MODEL_DIR = "outputs/models/best_model"
-    OUTPUT_FILE = "outputs/submission_2.csv"
+    DATA_DIR = "Amazon_products" 
+    if not os.path.exists(DATA_DIR) and os.path.exists("../Amazon_products"):
+        DATA_DIR = "../Amazon_products"
+        
+    method = "top_down_beam" # top_down_beam, leaf_priority, optimal_path
+    MODEL_DIR = "outputs/models/deberta_model"
+    OUTPUT_FILE = f"outputs/submission_deberta_{method}.csv"
     
     if not os.path.exists(DATA_DIR):
-        if os.path.exists(f"../{DATA_DIR}"): DATA_DIR = f"../{DATA_DIR}"
-        else: raise FileNotFoundError("Data directory not found")
+        raise FileNotFoundError(f"Data directory 'Amazon_products' not found.")
 
     # 1. Load Data
     loader = DataLoaderSimple(DATA_DIR)
@@ -341,17 +465,14 @@ if __name__ == "__main__":
     # 2. Setup Inference
     engine = InferenceEngine(
         model_dir=MODEL_DIR,
-        hierarchy_graph=loader.hierarchy_graph, # [FIX] Graph passed correctly
+        hierarchy_graph=loader.hierarchy_graph,
         num_classes=len(loader.all_classes)
     )
     
-    # 3. Predict
-    raw_preds = engine.predict(loader.test_corpus, batch_size=128, threshold=0.5)
+    # 3. Predict & Optimize
+    final_preds = engine.predict(loader.test_corpus, batch_size=128, method=method)
     
-    # 4. Expand Hierarchy (Child -> Parent)
-    expander = HierarchyExpander(loader.hierarchy_graph)
-    final_preds = expander.expand(raw_preds)
     
-    # 5. Save
+    # 4. Save
     engine.save_submission(final_preds, loader.test_ids, OUTPUT_FILE)
     logger.info("Done!")

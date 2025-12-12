@@ -48,22 +48,57 @@ class LBM(nn.Module):
         return scores
 
 class ClassModel(nn.Module):
-    def __init__(self, encoder_name, enc_dim, class_embeddings):
+    def __init__(self, encoder_name, enc_dim, class_embeddings, temperature=0.07):
         super(ClassModel, self).__init__()
         self.doc_encoder = AutoModel.from_pretrained(encoder_name)
         self.doc_dim = enc_dim
+
+        self.temperature = temperature
         
         self.num_classes, self.label_dim = class_embeddings.size()
-        # Initialize with provided embeddings (will be overwritten by load_state_dict)
+        # [중요] BERT 공간에 맞춰진 임베딩을 파라미터로 등록
         self.label_embedding_weights = nn.Parameter(class_embeddings.clone(), requires_grad=True)
         
-        self.interaction = LBM(self.doc_dim, self.label_dim, n_classes=self.num_classes, bias=False)
-
+    def mean_pooling(self, model_output, attention_mask):
+        """
+        MPNet(SBERT) Standard Pooling Strategy
+        """
+        token_embeddings = model_output.last_hidden_state
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, dim=1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
+        return sum_embeddings / sum_mask
+    
     def forward(self, input_ids, attention_mask):
+        # 1. Document Encoding (MPNet)
         outputs = self.doc_encoder(input_ids, attention_mask=attention_mask)
-        doc_tensor = outputs[1] # Pooler output
-        scores = self.interaction(doc_tensor, self.label_embedding_weights)
+        
+        # 2. Mean Pooling (Crucial for MPNet)
+        doc_vector = self.mean_pooling(outputs, attention_mask) # [Batch, 768]
+        
+        # 3. Normalization (Crucial for preventing Logit Explosion)
+        # MPNet은 Cosine Similarity 공간에서 학습되었으므로 정규화가 필수입니다.
+        doc_norm = F.normalize(doc_vector, p=2, dim=1)
+        label_norm = F.normalize(self.label_embedding_weights, p=2, dim=1)
+        
+        # 4. Simple Dot Product (Cosine Similarity)
+        # LBM 없이 직접 내적합니다.
+        # 수식: Score = (Doc / |Doc|) * (Label / |Label|)^T
+        scores = torch.matmul(doc_norm, label_norm.T) # [Batch, Num_Classes]
+        
+        # 5. Temperature Scaling
+        # Cosine Sim(-1~1)을 Sigmoid에 적합한 범위(예: -14~14)로 확장
+        scores = scores / self.temperature
+        
         return scores
+
+def multilabel_bce_loss_w(output, target, weight=None):
+    if weight is None:
+        weight = torch.ones_like(output)
+    # reduction='sum' matches authors' code, normalizing by batch size manually if needed
+    loss = F.binary_cross_entropy_with_logits(output, target, weight, reduction="sum")
+    return loss / output.size(0)
+
 
 # ============================================================================
 # 2. UTILS & DATA LOADING
@@ -82,13 +117,12 @@ class DataLoaderSimple:
     def load(self):
         logger.info("Loading test data and metadata...")
         # Load Test
-        with open(os.path.join(self.data_dir, "test", "test_corpus.txt"), 'r', encoding='utf-8') as f:
+        with open(os.path.join(self.data_dir, "test", "test_corpus_debug.txt"), 'r', encoding='utf-8') as f:
             for line in f:
                 parts = line.strip().split('\t', 1)
                 if len(parts) == 2: 
                     self.test_ids.append(parts[0])
                     self.test_corpus.append(parts[1])
-        
         # Load Classes
         with open(os.path.join(self.data_dir, "classes.txt"), 'r', encoding='utf-8') as f:
             for line in f:
@@ -121,10 +155,12 @@ class HierarchyExpander:
     def expand(self, labels_list):
         expanded = []
         for labels in tqdm(labels_list, desc="Expanding Hierarchy"):
+            print(f"labels: {labels}\n")
             label_set = set(labels)
             for l in labels:
                 label_set.update(self.get_ancestors(l))
             expanded.append(sorted(list(label_set)))
+            print(f"expanded: {expanded}\n")
         return expanded
 
 class WeightedMultiLabelDataset(Dataset):
@@ -182,7 +218,7 @@ def get_paths_to_root(graph, node):
         return [[node]]
     return paths
 
-def select_top_down_beam(probs, graph, beam_width=5, min_labels=2, max_labels=3):
+def select_top_down_beam(probs, graph, beam_width=10, min_labels=2, max_labels=3):
     """
     Top-Down Beam Search
     - 루트에서 시작하여 확률의 곱(Product)이 가장 높은 경로를 탐색
@@ -250,14 +286,19 @@ def select_top_down_beam(probs, graph, beam_width=5, min_labels=2, max_labels=3)
         (s, p) for s, p in completed_paths 
         if min_labels <= len(p) <= max_labels
     ]
+    print(f"valid_paths: {valid_paths}\n")
     
     if not valid_paths:
+        print(f"!!!! WARNING: no valid paths")
         # Fallback: 실패 시 가장 확률 높은 단일 노드라도 반환 (혹은 기존 방식 사용)
         best_idx = np.argmax(probs)
         return [int(best_idx)]
         
     # 점수가 가장 높은 경로 반환
+    # alpha = 2 # larger alpha -> more weight on length
+    # best_path = sorted(valid_paths, key=lambda x: math.pow(x[0], 1.0 / (len(x[1]) ** alpha)), reverse=True)[0][1]
     best_path = sorted(valid_paths, key=lambda x: x[0], reverse=True)[0][1]
+    print(f"best_path: {best_path}\n")
     return sorted(best_path)
 
 # ============================================================================
@@ -279,7 +320,9 @@ class InferenceEngine:
         # 1. Initialize Structure with Dummy Embeddings 
         # (Real weights will be loaded via load_state_dict)
         dummy_embeddings = torch.zeros(num_classes, 768)
-        self.model = ClassModel("bert-base-uncased", 768, dummy_embeddings)
+
+        target_model_name = "sentence-transformers/all-mpnet-base-v2"
+        self.model = ClassModel(target_model_name, 768, dummy_embeddings, temperature=0.07)
         
         # 2. Load Trained Weights
         state_dict = torch.load(model_path, map_location=self.device)
@@ -287,16 +330,20 @@ class InferenceEngine:
         self.model.to(self.device)
         self.model.eval()
         
-        self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        except:
+            logger.warning("Tokenizer not found in model_dir, loading from huggingface hub...")
+            self.tokenizer = AutoTokenizer.from_pretrained(target_model_name)
 
-    def predict(self, texts, batch_size=64, threshold=0.15):
+    def predict(self, texts, batch_size=64, method="top_down_beam"):
         dataset = WeightedMultiLabelDataset(
             texts, self.tokenizer, self.hierarchy_graph, self.num_classes
         )
         dataloader = TorchDataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
         
         all_preds = []
-        logger.info(f"Starting Inference with Threshold {threshold}...")
+        logger.info(f"Starting Inference with Method {method}...")
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Inference"):
@@ -306,7 +353,8 @@ class InferenceEngine:
                 outputs = self.model(input_ids, attention_mask)
                 probs = torch.sigmoid(outputs)
                 
-                preds = (probs > threshold).cpu().numpy()
+                
+                # preds = (probs > threshold).cpu().numpy()
                 
                 """for i, p in enumerate(preds):
                     indices = np.where(p)[0].tolist()
@@ -315,14 +363,26 @@ class InferenceEngine:
                         indices = [torch.argmax(probs[i]).item()]
                     all_preds.append(indices)"""
                 for doc_probs in probs:
-                    optimized_path = select_top_down_beam(
-                        doc_probs, 
-                        self.hierarchy_graph, 
-                        beam_width=20, 
-                        min_labels=2, 
-                        max_labels=3
-                    )
-                    all_preds.append(optimized_path)
+                    # Apply Top-Down Beam Search
+                    if method == "top_down_beam":
+                        path = select_top_down_beam(
+                            doc_probs, 
+                            self.hierarchy_graph, 
+                            beam_width=10,
+                            min_labels=2, 
+                            max_labels=3
+                        )
+                    elif method == "leaf_priority":
+                        path = select_leaf_priority(
+                            doc_probs, self.hierarchy_graph, min_labels=2, max_labels=3
+                        )
+                    elif method == "optimal_path":
+                        path = select_optimal_path(
+                            doc_probs, self.hierarchy_graph, top_k=10, min_labels=2, max_labels=3
+                        )
+                    else:
+                        raise ValueError(f"Invalid method: {method}")
+                    all_preds.append(path)
         return all_preds
 
     def save_submission(self, predictions, ids, output_path):
@@ -335,7 +395,7 @@ class InferenceEngine:
         df = pd.DataFrame(data)
         df.to_csv(output_path, index=False)
         
-        avg_len = df['labels'].apply(lambda x: len(x.split())).mean()
+        avg_len = df['labels'].apply(lambda x: len(x.split(','))).mean()
         logger.info(f"Submission Stats: Average Labels per Doc = {avg_len:.2f}")
 
 # ============================================================================
@@ -346,7 +406,7 @@ if __name__ == "__main__":
     # Settings
     DATA_DIR = "../Amazon_products"  # Adjust if needed
     MODEL_DIR = "outputs/models/best_model"
-    OUTPUT_FILE = "outputs/submission_top.csv"
+    OUTPUT_FILE = "outputs/submit_debugging.csv"
     
     if not os.path.exists(DATA_DIR):
         if os.path.exists(f"../{DATA_DIR}"): DATA_DIR = f"../{DATA_DIR}"
@@ -364,11 +424,7 @@ if __name__ == "__main__":
     )
     
     # 3. Predict
-    raw_preds = engine.predict(loader.test_corpus, batch_size=128, threshold=0.2)
-    
-    # 4. Expand Hierarchy (Child -> Parent)
-    expander = HierarchyExpander(loader.hierarchy_graph)
-    final_preds = expander.expand(raw_preds)
+    final_preds = engine.predict(loader.test_corpus, batch_size=128, method="top_down_beam")
     
     # 5. Save
     engine.save_submission(final_preds, loader.test_ids, OUTPUT_FILE)
