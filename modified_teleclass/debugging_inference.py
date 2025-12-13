@@ -405,7 +405,7 @@ class InferenceEngine:
 if __name__ == "__main__":
     # Settings
     DATA_DIR = "../Amazon_products"  # Adjust if needed
-    MODEL_DIR = "outputs/models/best_model"
+    MODEL_DIR = "outputs/models/checkpoint_epoch_5"
     OUTPUT_FILE = "outputs/submit_debugging.csv"
     
     if not os.path.exists(DATA_DIR):

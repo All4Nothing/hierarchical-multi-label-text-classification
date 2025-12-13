@@ -55,9 +55,7 @@ from tqdm import tqdm
 import json
 import logging
 import openai
-from sklearn.model_selection import train_test_split
 from transformers import get_linear_schedule_with_warmup
-import re
 
 # Setup logging
 logging.basicConfig(
@@ -309,7 +307,7 @@ class TELEClassTrainer:
         self.num_classes = num_classes
 
     def train(self, train_texts, train_labels, is_augmented_mask, aug_scaling, 
-              hierarchy_graph, epochs=20, lr=2e-5, batch_size=16, output_dir="outputs", val_split=0.1, patience=5, save_interval=5):
+              hierarchy_graph, epochs=20, lr=2e-5, batch_size=16, output_dir="outputs", patience=5, save_interval=5):
         
         eff_batch_size = batch_size * max(1, len(self.available_gpus))
         
@@ -322,7 +320,7 @@ class TELEClassTrainer:
         # 1. Validation Split (데이터 분리)
         # Stratified Split을 하면 좋지만, Multi-label이므로 단순 Random Split 사용
         # 입력 데이터 리스트들을 함께 분리하기 위해 zip으로 묶었다가 품
-        logger.info(f"Splitting data: {1.0-val_split:.0%} Train, {val_split:.0%} Validation")
+        logger.info(f"No splitting data")
         
         # aug_scaling이 None이거나 스칼라인 경우 리스트로 변환
         if aug_scaling is None:
@@ -332,23 +330,18 @@ class TELEClassTrainer:
             aug_scaling = [aug_scaling] * len(train_texts)
 
         # 데이터 분리
-        tr_texts, val_texts, tr_labels, val_labels, tr_mask, val_mask, tr_scale, val_scale = train_test_split(
-            train_texts, train_labels, is_augmented_mask, aug_scaling, 
-            test_size=val_split, random_state=42
-        )
+        tr_texts = train_texts
+        tr_labels = train_labels
+        tr_mask = is_augmented_mask
+        tr_scale = aug_scaling
 
         # 2. Dataset & DataLoader 생성
         train_dataset = WeightedMultiLabelDataset(
             tr_texts, tr_labels, self.tokenizer, hierarchy_graph, self.num_classes,
             is_augmented_mask=tr_mask, augmentation_scaling=tr_scale
         )
-        val_dataset = WeightedMultiLabelDataset(
-            val_texts, val_labels, self.tokenizer, hierarchy_graph, self.num_classes,
-            is_augmented_mask=val_mask, augmentation_scaling=val_scale
-        )
 
         train_loader = TorchDataLoader(train_dataset, batch_size=eff_batch_size, shuffle=True, num_workers=4)
-        val_loader = TorchDataLoader(val_dataset, batch_size=eff_batch_size, shuffle=False, num_workers=4)
 
         # Author's Optimizer Settings
         no_decay = ["bias", "LayerNorm.weight"]
@@ -395,36 +388,13 @@ class TELEClassTrainer:
             
             avg_train_loss = total_loss / len(train_loader)
 
-            # Validation
-            self.model.eval()
-            total_val_loss = 0
-            with torch.no_grad():
-                for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
-                    input_ids = batch['input_ids'].to(self.primary_device)
-                    attention_mask = batch['attention_mask'].to(self.primary_device)
-                    labels = batch['labels'].to(self.primary_device)
-                    sample_mask = batch['sample_mask'].to(self.primary_device) # Val에서는 보통 weight 1.0이지만 형식 유지
-                    
-                    outputs = self.model(input_ids, attention_mask)
-                    loss = multilabel_bce_loss_w(outputs, labels, sample_mask)
-                    total_val_loss += loss.item()
-
-            avg_val_loss = total_val_loss / len(val_loader)
-            logger.info(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
-
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                patience_counter = 0
-                logger.info(f"New Best Val Loss! Saving best model to {output_dir}/best_model")
-                self.save_model(os.path.join(output_dir, "best_model"))
-            else:
-                patience_counter += 1
-                logger.info(f"Patience {patience_counter}/{patience} - No improvement")
+            
+            logger.info(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f}")
 
             # Save Checkpoint
-            # if (epoch + 1) % save_interval == 0:
-            self.save_model(os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}"))
-            logger.info(f"Saved checkpoint to {output_dir}/checkpoint_epoch_{epoch+1}")
+            if (epoch + 1) % save_interval == 0:
+                self.save_model(os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}"))
+                logger.info(f"Saved checkpoint to {output_dir}/checkpoint_epoch_{epoch+1}")
 
             if patience_counter >= patience:
                 logger.info(f"Early stopping triggered after {patience} epochs without improvement")
@@ -924,34 +894,11 @@ class AugmentationModule:
         if not self.openai_client:
             return []
             
-        # prompt = f"""
-        #Write {count} distinct Amazon product reviews for the category: "{class_name}".
-        #Each review should be 1-2 sentences long, focusing on features relevant to "{class_name}".
-        #Output format: Just the reviews, one per line. No numbering.
-        #"""
         prompt = f"""
-        Act as a real Amazon customer writing a review.
-        Target Category: "{class_name}"
-        
-        Your goal is to generate {count} raw, authentic datasets that look exactly like the "Real Examples" below.
-        
-        --- REAL EXAMPLES (Mimic this style) ---
-        1. bigelow tea ( 6 pack ) the flavor of bigelow 's earl gray tea is the best i have ever tasted . sophisticated , smooth , and mellow , with just the right blend of bergamot . i drink this decaffeinated version every evening . wonderful !
-        2. vtech build discover workbench my son got this for christmas and he loves it ! there are lots of things to do , even for a 26 month old who ca n't quite follow the directions yet . he enjoys being able to turn the screws and bolts . my only complaint is that it has no volume control .
-        3. moisturizing shampoo from kenra 10 . 1 oz good price for a great product . it 's less expensive than buying in a store or shop . i also use the kenra conditioner .
-        ---------------------------------------
-
-        CRITICAL WRITING RULES:
-        1. **Variable Structure:** Do NOT use the same format for every line. Some product titles should be short, some long with specs (oz, pack, watts).
-        2. **Messy Titles:** Put specs like "10.1 oz" or "( 6 pack )" sometimes at the end, sometimes in the middle of the title.
-        3. **Diverse Content:** - Don't mention price ($) or shipping in every review. Focus on usage, smell, texture, family reaction, or specific pros/cons.
-           - Vary length! Write some short reviews (1 sentence) and some long detailed stories (3-4 sentences).
-        4. **Natural Tone:** Use lowercase. It's okay to be conversational. Use "i" instead of "I" sometimes.
-        5. **Spacing:** Try to put spaces before punctuation like " .", " ,", " !" to match the examples.
-        
-        Generate {count} reviews now (one per line, no numbering):
+        Write {count} distinct Amazon product reviews for the category: "{class_name}".
+        Each review should be 1-2 sentences long, focusing on features relevant to "{class_name}".
+        Output format: Just the reviews, one per line. No numbering.
         """
-        
         try:
             response = self.openai_client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -963,27 +910,6 @@ class AugmentationModule:
         except Exception as e:
             logger.error(f"Augmentation failed for {class_name}: {e}")
             return []
-
-    def calibrate_text_style(self, text):
-        # 1. 소문자 변환
-        text = text.lower()
-        
-        # 2. 구두점 앞 공백 추가 (실제 데이터 스타일 모사)
-        # 마침표, 쉼표, 느낌표, 물음표 앞에 공백이 없으면 추가
-        text = re.sub(r'([a-zA-Z0-9])([.,!?])', r'\1 \2', text)
-        
-        # 3. 단축형(Contraction) 분리 (예: can't -> ca n't, it's -> it 's)
-        # Amazon 데이터셋의 전형적인 특징입니다.
-        text = text.replace("n't", " n't")
-        text = text.replace("'s", " 's")
-        text = text.replace("'ve", " 've")
-        text = text.replace("'re", " 're")
-        
-        # 4. 불필요한 공백 정리
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        return text
-
         
 
     def generate_augmentation_data(
@@ -1002,10 +928,11 @@ class AugmentationModule:
             class_name = self.data_loader.all_classes[class_idx]
             
             # 실제 데이터 개수 확인 (여기선 단순화를 위해 무조건 5개 추가 생성으로 가정하거나 로직 정교화 가능)
+            # 여기서는 단순히 클래스당 5개씩만 추가해 봅니다.
             new_reviews = self.generate_synthetic_data(class_idx, class_name, count=5)
             
             for review in new_reviews:
-                aug_texts.append(self.calibrate_text_style(review))
+                aug_texts.append(review)
                 aug_labels.append([class_idx]) # 레이블은 해당 클래스 하나만 부여 (나중에 확장됨)
 
                 
@@ -1171,40 +1098,16 @@ class MultiGPUTELEClassPipeline:
             data_loader.all_indices,
             threshold=15
         )
-        
-        # Check if augmented_data.txt already exists
+        augmented_texts, augmented_labels = aug_module.generate_augmentation_data(starved_classes)
+
+        # Save augmented data to a txt file
         aug_save_path = os.path.join(self.output_dir, "augmented_data.txt")
-        if os.path.exists(aug_save_path):
-            # Load existing augmented data
-            logger.info(f"Loading existing augmented data from {aug_save_path}")
-            augmented_texts = []
-            augmented_labels = []
-            with open(aug_save_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    # Parse format: label_str: {label_str}\ttext: {txt}
-                    parts = line.split("\t")
-                    if len(parts) == 2:
-                        label_part = parts[0].replace("label_str: ", "")
-                        text_part = parts[1].replace("text: ", "")
-                        # Parse label_str (comma-separated integers)
-                        label = [int(x) for x in label_part.split(",") if x.strip()]
-                        augmented_labels.append(label)
-                        augmented_texts.append(text_part)
-            logger.info(f"Loaded {len(augmented_texts)} augmented samples from existing file")
-        else:
-            # Generate new augmented data
-            augmented_texts, augmented_labels = aug_module.generate_augmentation_data(starved_classes)
-            
-            # Save augmented data to a txt file
-            with open(aug_save_path, "w", encoding="utf-8") as f:
-                for txt, label in zip(augmented_texts, augmented_labels):
-                    # Save as tab-separated: text \t label_indices_comma_separated
-                    label_str = ",".join(map(str, label))
-                    f.write(f"label_str: {label_str}\ttext: {txt}\n")
-            logger.info(f"Augmented data saved to {aug_save_path}")
+        with open(aug_save_path, "w", encoding="utf-8") as f:
+            for txt, label in zip(augmented_texts, augmented_labels):
+                # Save as tab-separated: text \t label_indices_comma_separated
+                label_str = ",".join(map(str, label))
+                f.write(f"label_str: {label_str}\ttext: {txt}\n")
+        logger.info(f"Augmented data saved to {aug_save_path}")
         
         # Phase 4: Hierarchy Expansion
         logger.info("\n" + "="*80)
@@ -1304,7 +1207,7 @@ class MultiGPUTELEClassPipeline:
             is_augmented_mask,
             aug_scaling,
             data_loader.hierarchy_graph,
-            epochs=10, # MPNet은 수렴이 빠르므로 epoch가 적어도 될 수 있음
+            epochs=5, # MPNet은 수렴이 빠르므로 epoch가 적어도 될 수 있음
             lr=2e-5,
             output_dir=os.path.join(self.output_dir, "models")
         )

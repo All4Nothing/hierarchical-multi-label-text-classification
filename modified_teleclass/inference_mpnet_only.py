@@ -217,7 +217,8 @@ def get_paths_to_root(graph, node):
         return [[node]]
     return paths
 
-def select_top_down_beam(probs, graph, beam_width=5, min_labels=2, max_labels=3):
+def select_top_down_beam(probs, graph, beam_width=5, min_labels=2, max_labels=3, alpha=3):
+    # larger alpha -> more weight on length
     """
     Top-Down Beam Search
     - 루트에서 시작하여 확률의 곱(Product)이 가장 높은 경로를 탐색
@@ -294,7 +295,6 @@ def select_top_down_beam(probs, graph, beam_width=5, min_labels=2, max_labels=3)
         
     # 점수가 가장 높은 경로 반환
     # best_path = sorted(valid_paths, key=lambda x: x[0], reverse=True)[0][1]
-    alpha = 2 # larger alpha -> more weight on length
     best_path = sorted(valid_paths, key=lambda x: math.pow(x[0], 1.0 / (len(x[1]) ** alpha)), reverse=True)[0][1]
     return sorted(best_path)
 
@@ -485,7 +485,7 @@ class InferenceEngine:
             logger.warning("Tokenizer not found in model_dir, loading from huggingface hub...")
             self.tokenizer = AutoTokenizer.from_pretrained(target_model_name)
 
-    def predict(self, texts, batch_size=64, method="top_down_beam"):
+    def predict(self, texts, batch_size=64, method="top_down_beam", alpha=3):
         dataset = WeightedMultiLabelDataset(
             texts, self.tokenizer, self.hierarchy_graph, self.num_classes
         )
@@ -519,7 +519,8 @@ class InferenceEngine:
                             self.hierarchy_graph, 
                             beam_width=10,
                             min_labels=2, 
-                            max_labels=3
+                            max_labels=3,
+                            alpha=alpha
                         )
                     elif method == "leaf_priority":
                         path = select_leaf_priority(
@@ -554,9 +555,10 @@ class InferenceEngine:
 if __name__ == "__main__":
     # Settings
 
-    method = "leaf_priority" # top_down_beam, leaf_priority, optimal_path
+    method = "top_down_beam" # top_down_beam, leaf_priority, optimal_path, 
+    alpha=3 # larger alpha -> more weight on length
     DATA_DIR = "../Amazon_products"  # Adjust if needed
-    MODEL_DIR = "outputs/models/best_model" # "outputs/models/bert_model"
+    MODEL_DIR = "outputs/models/checkpoint_epoch_3" # "outputs/models/best_model"
     OUTPUT_FILE = f"outputs/submission_mpnet_enriched_{method}.csv"
     
     if not os.path.exists(DATA_DIR):
@@ -575,7 +577,7 @@ if __name__ == "__main__":
     )
     
     # 3. Predict
-    final_preds = engine.predict(loader.test_corpus, batch_size=128, method=method)
+    final_preds = engine.predict(loader.test_corpus, batch_size=128, method=method, alpha=alpha)
     
     # 5. Save
     engine.save_submission(final_preds, loader.test_ids, OUTPUT_FILE)
