@@ -113,6 +113,13 @@ class ClassModel(nn.Module):
         self.num_classes, self.label_dim = class_embeddings.size()
         # [중요] BERT 공간에 맞춰진 임베딩을 파라미터로 등록
         self.label_embedding_weights = nn.Parameter(class_embeddings.clone(), requires_grad=True)
+
+        """self.projection = nn.Sequential(
+            nn.Linear(enc_dim, enc_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(enc_dim, enc_dim) # 다시 원래 차원으로
+        )"""
         
     def mean_pooling(self, model_output, attention_mask):
         """
@@ -130,18 +137,21 @@ class ClassModel(nn.Module):
         
         # 2. Mean Pooling (Crucial for MPNet)
         doc_vector = self.mean_pooling(outputs, attention_mask) # [Batch, 768]
+
+        # 3. Projection (Crucial for MPNet)
+        # doc_vector = self.projection(doc_vector)
         
-        # 3. Normalization (Crucial for preventing Logit Explosion)
+        # 4. Normalization (Crucial for preventing Logit Explosion)
         # MPNet은 Cosine Similarity 공간에서 학습되었으므로 정규화가 필수입니다.
         doc_norm = F.normalize(doc_vector, p=2, dim=1)
         label_norm = F.normalize(self.label_embedding_weights, p=2, dim=1)
         
-        # 4. Simple Dot Product (Cosine Similarity)
+        # 5. Simple Dot Product (Cosine Similarity)
         # LBM 없이 직접 내적합니다.
         # 수식: Score = (Doc / |Doc|) * (Label / |Label|)^T
         scores = torch.matmul(doc_norm, label_norm.T) # [Batch, Num_Classes]
         
-        # 5. Temperature Scaling
+        # 6. Temperature Scaling
         # Cosine Sim(-1~1)을 Sigmoid에 적합한 범위(예: -14~14)로 확장
         scores = scores / self.temperature
         
@@ -167,6 +177,26 @@ def multilabel_bce_loss_w(output, target, weight=None):
         reduction="mean" 
     )
     return loss
+
+def custom_focal_loss(inputs, targets, weight=None, alpha=1, gamma=2.0):
+    """
+    Focal Loss with Sample Weight support.
+    """
+    # 1. 기본 BCE 계산 (reduction='none'으로 개별 Loss 확보)
+    bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+    
+    # 2. pt (정답 확률) 계산
+    pt = torch.exp(-bce_loss)
+    
+    # 3. Focal Term ((1-pt)^gamma) 적용
+    f_loss = alpha * (1 - pt) ** gamma * bce_loss
+    
+    # 4. Sample Mask (Weight) 적용
+    # 기존 코드의 sample_mask (Real/Aug 데이터 가중치 등)를 여기서 곱해줍니다.
+    if weight is not None:
+        f_loss = f_loss * weight
+        
+    return f_loss.mean()
 
 # ============================================================================
 # UPDATED DATASET (Matches prepare_training_data.py logic)
@@ -308,8 +338,10 @@ class TELEClassTrainer:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.num_classes = num_classes
 
-    def train(self, train_texts, train_labels, is_augmented_mask, aug_scaling, 
-              hierarchy_graph, epochs=20, lr=2e-5, batch_size=16, output_dir="outputs", val_split=0.1, patience=5, save_interval=5):
+    def train(self, train_texts, train_labels, train_mask, train_scaling, # Train Data
+              val_texts, val_labels, val_mask, val_scaling,         # Validation Data
+              hierarchy_graph, epochs=5, lr=2e-5, batch_size=16, 
+              output_dir="outputs", patience=5, save_interval=5):
         
         eff_batch_size = batch_size * max(1, len(self.available_gpus))
         
@@ -319,32 +351,16 @@ class TELEClassTrainer:
         )
         dataloader = TorchDataLoader(dataset, batch_size=eff_batch_size, shuffle=True, num_workers=4)
         """
-        # 1. Validation Split (데이터 분리)
-        # Stratified Split을 하면 좋지만, Multi-label이므로 단순 Random Split 사용
-        # 입력 데이터 리스트들을 함께 분리하기 위해 zip으로 묶었다가 품
-        logger.info(f"Splitting data: {1.0-val_split:.0%} Train, {val_split:.0%} Validation")
         
-        # aug_scaling이 None이거나 스칼라인 경우 리스트로 변환
-        if aug_scaling is None:
-            aug_scaling = [1.0] * len(train_texts)
-        elif not isinstance(aug_scaling, (list, tuple, np.ndarray)):
-            # 스칼라 값인 경우 리스트로 변환
-            aug_scaling = [aug_scaling] * len(train_texts)
-
-        # 데이터 분리
-        tr_texts, val_texts, tr_labels, val_labels, tr_mask, val_mask, tr_scale, val_scale = train_test_split(
-            train_texts, train_labels, is_augmented_mask, aug_scaling, 
-            test_size=val_split, random_state=42
-        )
 
         # 2. Dataset & DataLoader 생성
         train_dataset = WeightedMultiLabelDataset(
-            tr_texts, tr_labels, self.tokenizer, hierarchy_graph, self.num_classes,
-            is_augmented_mask=tr_mask, augmentation_scaling=tr_scale
+            train_texts, train_labels, self.tokenizer, hierarchy_graph, self.num_classes,
+            is_augmented_mask=train_mask, augmentation_scaling=train_scaling
         )
         val_dataset = WeightedMultiLabelDataset(
             val_texts, val_labels, self.tokenizer, hierarchy_graph, self.num_classes,
-            is_augmented_mask=val_mask, augmentation_scaling=val_scale
+            is_augmented_mask=val_mask, augmentation_scaling=val_scaling
         )
 
         train_loader = TorchDataLoader(train_dataset, batch_size=eff_batch_size, shuffle=True, num_workers=4)
@@ -384,7 +400,8 @@ class TELEClassTrainer:
                 
                 optimizer.zero_grad()
                 outputs = self.model(input_ids, attention_mask)
-                loss = multilabel_bce_loss_w(outputs, labels, sample_mask)
+                # loss = multilabel_bce_loss_w(outputs, labels, sample_mask)
+                loss = custom_focal_loss(outputs, labels, sample_mask)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
@@ -406,7 +423,7 @@ class TELEClassTrainer:
                     sample_mask = batch['sample_mask'].to(self.primary_device) # Val에서는 보통 weight 1.0이지만 형식 유지
                     
                     outputs = self.model(input_ids, attention_mask)
-                    loss = multilabel_bce_loss_w(outputs, labels, sample_mask)
+                    loss = custom_focal_loss(outputs, labels, sample_mask)
                     total_val_loss += loss.item()
 
             avg_val_loss = total_val_loss / len(val_loader)
@@ -1272,18 +1289,36 @@ class MultiGPUTELEClassPipeline:
             data_loader.all_classes
         )
         
-        # 2. Prepare Data (All Corpus + Augmentation)
-        final_train_texts = data_loader.all_corpus + augmented_texts
-        final_train_labels = expanded_labels + augmented_labels
+        # A. Real Data 인덱스 분리
+        # 전체 리얼 데이터의 인덱스를 9:1로 나눕니다.
+        real_indices = np.arange(len(data_loader.all_corpus))
+        train_idx, val_idx = train_test_split(real_indices, test_size=0.1, random_state=42)
         
-        # 3. Augmentation Mask & Scaling
-        is_augmented_mask = [False] * len(data_loader.all_corpus) + [True] * len(augmented_texts)
+        # B. Real Train / Real Val 데이터 구성
+        real_train_texts = [data_loader.all_corpus[i] for i in train_idx]
+        real_train_labels = [expanded_labels[i] for i in train_idx]
         
-        num_real = len(data_loader.all_corpus)
-        num_aug = len(augmented_texts)
-        # aug_scaling = float(num_real) / num_aug if num_aug > 0 else 1.0
-        aug_scaling = 1.0
-        logger.info(f"Augmentation Scaling Factor: {aug_scaling:.4f}")
+        val_texts = [data_loader.all_corpus[i] for i in val_idx]
+        val_labels = [expanded_labels[i] for i in val_idx]
+        
+        # Validation 메타데이터 (Augmentation 없음)
+        val_mask = [False] * len(val_texts)
+        val_scaling = [1.0] * len(val_texts) 
+
+        # C. Augmentation Injection (Train 쪽에만 주입)
+        # Train = Real Train + Augmented Data
+        final_train_texts = real_train_texts + augmented_texts
+        final_train_labels = real_train_labels + augmented_labels
+        
+        # Train 메타데이터 (Real은 False, Aug는 True)
+        train_mask = [False] * len(real_train_texts) + [True] * len(augmented_texts)
+        
+        # Scaling Factor (이전에 논의된 대로 1.0으로 고정하거나 계산)
+        aug_scaling_value = 1.0 
+        train_scaling = [1.0] * len(real_train_texts) + [aug_scaling_value] * len(augmented_texts)
+        
+        logger.info(f"  - Final Train Size: {len(final_train_texts)} (Real: {len(real_train_texts)} + Aug: {len(augmented_texts)})")
+        logger.info(f"  - Clean Val Size:   {len(val_texts)} (All Real)")
 
         # 4. Initialize Trainer with MPNet Config
         config = AutoConfig.from_pretrained(target_model_name)
@@ -1299,12 +1334,16 @@ class MultiGPUTELEClassPipeline:
         
         # 5. Train
         trainer.train(
-            final_train_texts,
-            final_train_labels,
-            is_augmented_mask,
-            aug_scaling,
-            data_loader.hierarchy_graph,
-            epochs=10, # MPNet은 수렴이 빠르므로 epoch가 적어도 될 수 있음
+            train_texts=final_train_texts,
+            train_labels=final_train_labels,
+            train_mask=train_mask,
+            train_scaling=train_scaling,
+            val_texts=val_texts,      # [NEW] 검증 데이터 전달
+            val_labels=val_labels,    # [NEW]
+            val_mask=val_mask,        # [NEW]
+            val_scaling=val_scaling,  # [NEW]
+            hierarchy_graph=data_loader.hierarchy_graph,
+            epochs=10,
             lr=2e-5,
             output_dir=os.path.join(self.output_dir, "models")
         )

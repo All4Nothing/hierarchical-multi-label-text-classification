@@ -58,6 +58,13 @@ class ClassModel(nn.Module):
         self.num_classes, self.label_dim = class_embeddings.size()
         # [중요] BERT 공간에 맞춰진 임베딩을 파라미터로 등록
         self.label_embedding_weights = nn.Parameter(class_embeddings.clone(), requires_grad=True)
+
+        """self.projection = nn.Sequential(
+            nn.Linear(enc_dim, enc_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(enc_dim, enc_dim) # 다시 원래 차원으로
+        )"""
         
     def mean_pooling(self, model_output, attention_mask):
         """
@@ -75,18 +82,21 @@ class ClassModel(nn.Module):
         
         # 2. Mean Pooling (Crucial for MPNet)
         doc_vector = self.mean_pooling(outputs, attention_mask) # [Batch, 768]
+
+        # 3. Projection (Crucial for MPNet)
+        # doc_vector = self.projection(doc_vector)
         
-        # 3. Normalization (Crucial for preventing Logit Explosion)
+        # 4. Normalization (Crucial for preventing Logit Explosion)
         # MPNet은 Cosine Similarity 공간에서 학습되었으므로 정규화가 필수입니다.
         doc_norm = F.normalize(doc_vector, p=2, dim=1)
         label_norm = F.normalize(self.label_embedding_weights, p=2, dim=1)
         
-        # 4. Simple Dot Product (Cosine Similarity)
+        # 5. Simple Dot Product (Cosine Similarity)
         # LBM 없이 직접 내적합니다.
         # 수식: Score = (Doc / |Doc|) * (Label / |Label|)^T
         scores = torch.matmul(doc_norm, label_norm.T) # [Batch, Num_Classes]
         
-        # 5. Temperature Scaling
+        # 6. Temperature Scaling
         # Cosine Sim(-1~1)을 Sigmoid에 적합한 범위(예: -14~14)로 확장
         scores = scores / self.temperature
         
