@@ -12,6 +12,8 @@ from torch.nn.parameter import Parameter
 from torch.nn import init
 from torch.utils.data import Dataset, DataLoader as TorchDataLoader
 from transformers import AutoTokenizer, AutoModel
+from typing import List, Dict, Tuple, Set, Optional
+
 import pandas as pd
 import networkx as nx
 import numpy as np
@@ -29,89 +31,130 @@ logger = logging.getLogger(__name__)
 # 1. MODEL ARCHITECTURE (Must match training)
 # ============================================================================
 
-class LBM(nn.Module):
-    def __init__(self, l_dim, r_dim, n_classes=None, bias=True):
-        super(LBM, self).__init__()
-        self.weight = Parameter(torch.Tensor(l_dim, r_dim))
-        self.use_bias = bias
-        if self.use_bias:
-            self.bias = Parameter(torch.Tensor(n_classes))
-        bound = 1.0 / math.sqrt(l_dim)
-        init.uniform_(self.weight, -bound, bound)
-        if self.use_bias:
-            init.uniform_(self.bias, -bound, bound)
+def build_normalized_adjacency(hierarchy_graph: nx.DiGraph, all_classes: List[str], idx_to_class_name: Dict[int, str]) -> torch.Tensor:
+    """
+    Constructs a symmetrically normalized adjacency matrix.
+    Safe mapping: Raw ID -> Class Name -> Matrix Index (0 ~ N-1)
+    """
+    num_classes = len(all_classes)
+    
+    # 1. Map Class Name -> Matrix Index (0 ~ N-1)
+    # all_classes 리스트의 순서가 곧 모델의 레이블 인덱스입니다.
+    name_to_model_idx = {name: i for i, name in enumerate(all_classes)}
+    
+    # 2. Initialize with Identity (Self-loops)
+    adj = torch.eye(num_classes)
+    
+    # 3. Add Edges with ID Mapping
+    # hierarchy_graph의 노드는 Raw ID(int)로 되어 있다고 가정
+    edge_count = 0
+    for u_raw, v_raw in hierarchy_graph.edges():
+        # Raw ID를 이용해 이름 조회
+        u_name = idx_to_class_name.get(u_raw)
+        v_name = idx_to_class_name.get(v_raw)
+        
+        # 두 노드가 모두 학습 대상 클래스 목록에 있을 때만 엣지 추가
+        if u_name in name_to_model_idx and v_name in name_to_model_idx:
+            u = name_to_model_idx[u_name]
+            v = name_to_model_idx[v_name]
+            
+            # Symmetric Connection (Information flows both ways)
+            adj[u, v] = 1.0
+            adj[v, u] = 1.0
+            edge_count += 1
+            
+    logger.info(f"Constructed Adjacency Matrix: {num_classes} nodes, {edge_count} edges (mapped from raw hierarchy)")
 
-    def forward(self, e1, e2):
-        scores = torch.matmul(torch.matmul(e1, self.weight), e2.T)
-        if self.use_bias:
-            scores = scores + self.bias
-        return scores
+    # 4. Symmetric Normalization: D^-0.5 * A * D^-0.5
+    row_sum = torch.sum(adj, dim=1)
+    d_inv_sqrt = torch.pow(row_sum, -0.5)
+    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
+    d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
+    
+    adj_normalized = torch.mm(torch.mm(d_mat_inv_sqrt, adj), d_mat_inv_sqrt)
+    
+    return adj_normalized
 
-class ClassModel(nn.Module):
-    def __init__(self, encoder_name, enc_dim, class_embeddings, temperature=0.1):
-        super(ClassModel, self).__init__()
+# ============================================================================
+# NEW: GNN LAYERS & MODEL
+# ============================================================================
+
+class GraphConvolution(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(GraphConvolution, self).__init__()
+        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.FloatTensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, input_feat, adj):
+        support = torch.mm(input_feat, self.weight)
+        output = torch.mm(adj, support)
+        if self.bias is not None:
+            return output + self.bias
+        return output
+
+class GNNClassModel(nn.Module):
+    def __init__(self, encoder_name, enc_dim, class_embeddings, adj_matrix, initial_temp=0.07):
+        super(GNNClassModel, self).__init__()
         self.doc_encoder = AutoModel.from_pretrained(encoder_name)
-        self.doc_dim = enc_dim
-
-        self.temperature = temperature
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        
+        # Buffer로 등록하면 state_dict에 저장되고 GPU로 자동 이동됨 (업데이트는 안 됨)
+        self.register_buffer('adj', adj_matrix)
         
         self.num_classes, self.label_dim = class_embeddings.size()
-        # [중요] BERT 공간에 맞춰진 임베딩을 파라미터로 등록
-        self.label_embedding_weights = nn.Parameter(class_embeddings.clone(), requires_grad=True)
-
-        """self.projection = nn.Sequential(
-            nn.Linear(enc_dim, enc_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(enc_dim, enc_dim) # 다시 원래 차원으로
-        )"""
         
+        # Initial Embeddings (MPNet output) -> Input Feature for GNN
+        self.class_emb_input = nn.Parameter(class_embeddings.clone(), requires_grad=True)
+        
+        # GCN Layers (Dimension Preserving: 768 -> 768)
+        self.gc1 = GraphConvolution(enc_dim, enc_dim)
+        self.gc2 = GraphConvolution(enc_dim, enc_dim)
+        self.relu = nn.LeakyReLU(0.2)
+        self.dropout = nn.Dropout(0.1)
+        
+        # Learnable Temperature
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / initial_temp))
+
     def mean_pooling(self, model_output, attention_mask):
-        """
-        MPNet(SBERT) Standard Pooling Strategy
-        """
         token_embeddings = model_output.last_hidden_state
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
         sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, dim=1)
         sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
         return sum_embeddings / sum_mask
-    
+
     def forward(self, input_ids, attention_mask):
-        # 1. Document Encoding (MPNet)
-        outputs = self.doc_encoder(input_ids, attention_mask=attention_mask)
-        
-        # 2. Mean Pooling (Crucial for MPNet)
-        doc_vector = self.mean_pooling(outputs, attention_mask) # [Batch, 768]
-
-        # 3. Projection (Crucial for MPNet)
-        # doc_vector = self.projection(doc_vector)
-        
-        # 4. Normalization (Crucial for preventing Logit Explosion)
-        # MPNet은 Cosine Similarity 공간에서 학습되었으므로 정규화가 필수입니다.
+        # A. Document Encoding
+        doc_outputs = self.doc_encoder(input_ids, attention_mask=attention_mask)
+        doc_vector = self.mean_pooling(doc_outputs, attention_mask)
         doc_norm = F.normalize(doc_vector, p=2, dim=1)
-        label_norm = F.normalize(self.label_embedding_weights, p=2, dim=1)
         
-        # 5. Simple Dot Product (Cosine Similarity)
-        # LBM 없이 직접 내적합니다.
-        # 수식: Score = (Doc / |Doc|) * (Label / |Label|)^T
-        scores = torch.matmul(doc_norm, label_norm.T) # [Batch, Num_Classes]
+        # B. Label Encoding via GNN
+        # Layer 1
+        x = self.gc1(self.class_emb_input, self.adj)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = x + self.class_emb_input # Residual 1
         
-        # 6. Temperature Scaling
-        # Cosine Sim(-1~1)을 Sigmoid에 적합한 범위(예: -14~14)로 확장
-        # scores = scores / self.temperature
-        logit_scale = self.logit_scale.exp().clamp(max=100) 
-        print(f"logit_scale: {logit_scale}\n")
-        scores = torch.matmul(doc_norm, label_norm.T) * logit_scale
+        # Layer 2
+        x = self.gc2(x, self.adj)
+        final_class_emb = x + self.class_emb_input # Residual 2
         
-        return scores
-
-def multilabel_bce_loss_w(output, target, weight=None):
-    if weight is None:
-        weight = torch.ones_like(output)
-    # reduction='sum' matches authors' code, normalizing by batch size manually if needed
-    loss = F.binary_cross_entropy_with_logits(output, target, weight, reduction="sum")
-    return loss / output.size(0)
+        label_norm = F.normalize(final_class_emb, p=2, dim=1)
+        
+        # C. Classification
+        cosine_sim = torch.matmul(doc_norm, label_norm.T)
+        scale = self.logit_scale.exp().clamp(max=100)
+        
+        return cosine_sim * scale
 
 
 # ============================================================================
@@ -178,34 +221,67 @@ class HierarchyExpander:
         return expanded
 
 class WeightedMultiLabelDataset(Dataset):
-    def __init__(self, texts, tokenizer, hierarchy_graph, num_classes, max_length=128):
+    def __init__(self, texts, labels, tokenizer, hierarchy_graph, num_classes, 
+                 is_augmented_mask=None, augmentation_scaling=1.0, max_length=128):
         self.texts = texts
+        self.labels = labels
         self.tokenizer = tokenizer
         self.hierarchy_graph = hierarchy_graph
         self.num_classes = num_classes
         self.max_length = max_length
         
-        # Precompute descendants (Required to avoid KeyError 0)
+        # [Logic from prepare_training_data.py]
+        self.is_augmented_mask = is_augmented_mask # List[bool]
+        self.augmentation_scaling = augmentation_scaling
+        
+        # Precompute descendants
         self.descendants_cache = {}
         for node in range(num_classes):
-            # Safe access for graph nodes
-            if hierarchy_graph.has_node(node):
-                self.descendants_cache[node] = nx.descendants(hierarchy_graph, node)
-            else:
-                self.descendants_cache[node] = set()
+            self.descendants_cache[node] = nx.descendants(hierarchy_graph, node)
 
     def __len__(self):
         return len(self.texts)
     
     def __getitem__(self, idx):
         text = self.texts[idx]
+        label_indices = self.labels[idx]
+        is_aug = self.is_augmented_mask[idx] if self.is_augmented_mask else False
+        
         encoding = self.tokenizer(
             text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt'
         )
+        
+        target = torch.zeros(self.num_classes)
+        target[label_indices] = 0.9
+        
+        # [Sample Mask Logic]
+        # 1. Default mask is 1.0
+        mask = torch.ones(self.num_classes)
+        
+        if is_aug:
+            # [Author's Logic] Augmented data gets a uniform scaling weight
+            # augmentation_scaling이 리스트인 경우 해당 샘플의 값을 사용
+            scaling_value = self.augmentation_scaling[idx] if isinstance(self.augmentation_scaling, (list, tuple, np.ndarray)) else self.augmentation_scaling
+            mask = mask * scaling_value
+        else:
+            # [Author's Logic] Real data: Mask out descendants of positive classes
+            # (Ambiguous: If parent is true, child might be true or false, so don't penalize)
+            mask[label_indices] *= 2.0 # 10.0 -> 2.0
+            
+            for pos_cls in label_indices:
+                descendants = self.descendants_cache.get(pos_cls, set())
+                for desc in descendants:
+                    if desc not in label_indices:
+                        mask[desc] = 0.0
+            
+            
         return {
             'input_ids': encoding['input_ids'].squeeze(0),
-            'attention_mask': encoding['attention_mask'].squeeze(0)
+            'attention_mask': encoding['attention_mask'].squeeze(0),
+            'labels': target,
+            'sample_mask': mask
         }
+
 
 
 # ============================================================================
@@ -232,7 +308,7 @@ def get_paths_to_root(graph, node):
         return [[node]]
     return paths
 
-def select_top_down_beam(probs, graph, beam_width=10, min_labels=2, max_labels=3):
+def select_top_down_beam(probs, graph, beam_width=10, min_labels=2, max_labels=3, alpha=3):
     """
     Top-Down Beam Search
     - 루트에서 시작하여 확률의 곱(Product)이 가장 높은 경로를 탐색
@@ -320,25 +396,48 @@ def select_top_down_beam(probs, graph, beam_width=10, min_labels=2, max_labels=3
 # ============================================================================
 
 class InferenceEngine:
-    def __init__(self, model_dir, hierarchy_graph, num_classes, device_id=0):
+    def __init__(self, model_dir, hierarchy_graph, all_classes, idx_to_class, device_id=0):
+        """
+        GCN Inference Engine
+        Args:
+            all_classes: List of class names (defines the order of 0~N index)
+            idx_to_class: Dict mapping Raw ID -> Class Name (for building graph)
+        """
         self.device = f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu'
         self.hierarchy_graph = hierarchy_graph
-        self.num_classes = num_classes
+        self.all_classes = all_classes
+        self.num_classes = len(all_classes)
         
         model_path = os.path.join(model_dir, "pytorch_model.bin")
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model weights not found at {model_path}")
             
-        logger.info(f"Loading model architecture and weights from {model_dir}...")
-        
-        # 1. Initialize Structure with Dummy Embeddings 
-        # (Real weights will be loaded via load_state_dict)
-        dummy_embeddings = torch.zeros(num_classes, 768)
+        logger.info(f"Loading GCN model from {model_dir}...")
 
-        target_model_name = "sentence-transformers/all-mpnet-base-v2"
-        self.model = ClassModel(target_model_name, 768, dummy_embeddings, temperature=0.07)
+        # 1. Build Adjacency Matrix (Must match training logic!)
+        # 학습 때와 똑같은 구조의 행렬을 만들어야 가중치가 제대로 작동합니다.
+        adj_matrix = build_normalized_adjacency(
+            hierarchy_graph, 
+            all_classes, 
+            idx_to_class
+        )
+        adj_matrix = adj_matrix.to(self.device)
         
-        # 2. Load Trained Weights
+        # 2. Initialize Structure with Dummy Embeddings 
+        # (실제 가중치는 load_state_dict로 덮어씌워지므로 초기값은 0이어도 무관함)
+        dummy_embeddings = torch.zeros(self.num_classes, 768)
+        target_model_name = "sentence-transformers/all-mpnet-base-v2"
+        
+        # [MODIFIED] ClassModel -> GNNClassModel
+        self.model = GNNClassModel(
+            encoder_name=target_model_name, 
+            enc_dim=768, 
+            class_embeddings=dummy_embeddings, 
+            adj_matrix=adj_matrix,
+            initial_temp=0.07 # 불러올 때 덮어씌워지므로 초기값은 상관없음
+        )
+        
+        # 3. Load Trained Weights
         state_dict = torch.load(model_path, map_location=self.device)
         self.model.load_state_dict(state_dict)
         self.model.to(self.device)
@@ -350,9 +449,20 @@ class InferenceEngine:
             logger.warning("Tokenizer not found in model_dir, loading from huggingface hub...")
             self.tokenizer = AutoTokenizer.from_pretrained(target_model_name)
 
-    def predict(self, texts, batch_size=64, method="top_down_beam"):
+    def predict(self, texts, batch_size=64, method="top_down_beam", alpha=3):
+        # [FIX] Dataset signature matching
+        # Training Dataset expects: (texts, labels, tokenizer, graph, num_classes...)
+        # We pass dummy labels (empty lists) for inference.
+        dummy_labels = [[] for _ in range(len(texts))]
+        
         dataset = WeightedMultiLabelDataset(
-            texts, self.tokenizer, self.hierarchy_graph, self.num_classes
+            texts, 
+            dummy_labels,  # Dummy labels
+            self.tokenizer, 
+            self.hierarchy_graph, 
+            self.num_classes,
+            is_augmented_mask=None,
+            augmentation_scaling=1.0
         )
         dataloader = TorchDataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
         
@@ -365,22 +475,29 @@ class InferenceEngine:
                 input_ids = batch['input_ids'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
                 
+                # GNN Forward Pass
                 outputs = self.model(input_ids, attention_mask)
                 probs = torch.sigmoid(outputs)
                 
-                
-                # preds = (probs > threshold).cpu().numpy()
-                
-                """for i, p in enumerate(preds):
-                    indices = np.where(p)[0].tolist()
-                    # Fallback: if no label predicted, pick top-1
-                    if not indices:
-                        indices = [torch.argmax(probs[i]).item()]
-                    all_preds.append(indices)"""
-                for doc_probs in probs:
-                    # Convert to numpy for easier manipulation
-                    doc_probs_np = doc_probs.cpu().numpy()
+                # --- Analysis Block (Optional) ---
+                # Check specifics for debugging
+                if doc_idx < 3: # Print first 3 docs only
+                    doc_probs_np = probs[0].cpu().numpy() # First in batch
+                    top_10_indices = np.argsort(doc_probs_np)[-10:][::-1]
+                    top_10_values = doc_probs_np[top_10_indices]
                     
+                    print(f"\n=== Document {doc_idx} Analysis ===")
+                    print("Top 10 Classes:")
+                    for idx, val in zip(top_10_indices, top_10_values):
+                        cls_name = self.all_classes[idx] if idx < len(self.all_classes) else str(idx)
+                        print(f"  {cls_name} ({idx}): {val:.6f}")
+                # ---------------------------------
+
+                # --- Search Strategy ---
+                # 배치 처리를 위해 루프를 돌며 Search 적용
+                # (Note: Search functions should be imported or defined)
+                batch_probs = probs.cpu().numpy()
+                for doc_probs in batch_probs:
                     # Get top 10 classes with their prediction values
                     top_10_indices = np.argsort(doc_probs_np)[-10:][::-1]  # Descending order
                     top_10_values = doc_probs_np[top_10_indices]
@@ -395,14 +512,14 @@ class InferenceEngine:
                         print(f"  Class {idx}: {val:.6f}")
                     print(f"Class 40 (baby_products): {class_40_value:.6f}")
                     
-                    # Apply Top-Down Beam Search
                     if method == "top_down_beam":
                         path = select_top_down_beam(
                             doc_probs, 
                             self.hierarchy_graph, 
                             beam_width=10,
                             min_labels=2, 
-                            max_labels=3
+                            max_labels=3,
+                            alpha=alpha
                         )
                     elif method == "leaf_priority":
                         path = select_leaf_priority(
@@ -412,10 +529,17 @@ class InferenceEngine:
                         path = select_optimal_path(
                             doc_probs, self.hierarchy_graph, top_k=10, min_labels=2, max_labels=3
                         )
+                    elif method == "threshold":
+                         # Simple Threshold fallback
+                         path = np.where(doc_probs > 0.15)[0].tolist()
+                         if not path:
+                             path = [np.argmax(doc_probs)]
                     else:
                         raise ValueError(f"Invalid method: {method}")
+                    
                     all_preds.append(path)
                     doc_idx += 1
+                    
         return all_preds
 
     def save_submission(self, predictions, ids, output_path):
@@ -430,15 +554,16 @@ class InferenceEngine:
         
         avg_len = df['labels'].apply(lambda x: len(x.split(','))).mean()
         logger.info(f"Submission Stats: Average Labels per Doc = {avg_len:.2f}")
-
 # ============================================================================
 # MAIN
 # ============================================================================
 
 if __name__ == "__main__":
     # Settings
+    method = "top_down_beam" # top_down_beam, leaf_priority, optimal_path, 
+    alpha=2 # larger alpha -> more weight on length
     DATA_DIR = "../Amazon_products"  # Adjust if needed
-    MODEL_DIR = "outputs/models/[Submit100]"
+    MODEL_DIR = "outputs/models/checkpoint_epoch_1"
     OUTPUT_FILE = "outputs/submit_debugging.csv"
     
     if not os.path.exists(DATA_DIR):
@@ -452,12 +577,14 @@ if __name__ == "__main__":
     # 2. Setup Inference
     engine = InferenceEngine(
         model_dir=MODEL_DIR,
-        hierarchy_graph=loader.hierarchy_graph, # [FIX] Graph passed correctly
-        num_classes=len(loader.all_classes)
+        hierarchy_graph=loader.hierarchy_graph, 
+        all_classes=loader.all_classes,      # [NEW] Pass class list
+        idx_to_class=loader.idx_to_class,    # [NEW] Pass ID mapping
+        device_id=0
     )
     
     # 3. Predict
-    final_preds = engine.predict(loader.test_corpus, batch_size=128, method="top_down_beam")
+    final_preds = engine.predict(loader.test_corpus, batch_size=64, method=method, alpha=alpha)
     
     # 5. Save
     engine.save_submission(final_preds, loader.test_ids, OUTPUT_FILE)

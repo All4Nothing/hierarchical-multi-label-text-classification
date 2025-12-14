@@ -103,104 +103,339 @@ logger = logging.getLogger(__name__)
 # AUTHOR'S MODEL ARCHITECTURE (From model.py)
 # ============================================================================
 
-class ClassModel(nn.Module):
-    def __init__(self, encoder_name, enc_dim, class_embeddings, temperature=0.1):
-        super(ClassModel, self).__init__()
-        self.doc_encoder = AutoModel.from_pretrained(encoder_name)
-        self.doc_dim = enc_dim
+def build_normalized_adjacency(hierarchy_graph: nx.DiGraph, all_classes: List[str], idx_to_class_name: Dict[int, str]) -> torch.Tensor:
+    """
+    Constructs a symmetrically normalized adjacency matrix.
+    Safe mapping: Raw ID -> Class Name -> Matrix Index (0 ~ N-1)
+    """
+    num_classes = len(all_classes)
+    
+    # 1. Map Class Name -> Matrix Index (0 ~ N-1)
+    # all_classes 리스트의 순서가 곧 모델의 레이블 인덱스입니다.
+    name_to_model_idx = {name: i for i, name in enumerate(all_classes)}
+    
+    # 2. Initialize with Identity (Self-loops)
+    adj = torch.eye(num_classes)
+    
+    # 3. Add Edges with ID Mapping
+    # hierarchy_graph의 노드는 Raw ID(int)로 되어 있다고 가정
+    edge_count = 0
+    for u_raw, v_raw in hierarchy_graph.edges():
+        # Raw ID를 이용해 이름 조회
+        u_name = idx_to_class_name.get(u_raw)
+        v_name = idx_to_class_name.get(v_raw)
+        
+        # 두 노드가 모두 학습 대상 클래스 목록에 있을 때만 엣지 추가
+        if u_name in name_to_model_idx and v_name in name_to_model_idx:
+            u = name_to_model_idx[u_name]
+            v = name_to_model_idx[v_name]
+            
+            # Symmetric Connection (Information flows both ways)
+            adj[u, v] = 1.0
+            adj[v, u] = 1.0
+            edge_count += 1
+            
+    logger.info(f"Constructed Adjacency Matrix: {num_classes} nodes, {edge_count} edges (mapped from raw hierarchy)")
 
-        self.temperature = temperature
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+    # 4. Symmetric Normalization: D^-0.5 * A * D^-0.5
+    row_sum = torch.sum(adj, dim=1)
+    d_inv_sqrt = torch.pow(row_sum, -0.5)
+    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
+    d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
+    
+    adj_normalized = torch.mm(torch.mm(d_mat_inv_sqrt, adj), d_mat_inv_sqrt)
+    
+    return adj_normalized
+
+# ============================================================================
+# NEW: GNN LAYERS & MODEL
+# ============================================================================
+
+class GraphConvolution(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super(GraphConvolution, self).__init__()
+        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
+        if bias:
+            self.bias = nn.Parameter(torch.FloatTensor(out_features))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, input_feat, adj):
+        support = torch.mm(input_feat, self.weight)
+        output = torch.mm(adj, support)
+        if self.bias is not None:
+            return output + self.bias
+        return output
+
+class GNNClassModel(nn.Module):
+    def __init__(self, encoder_name, enc_dim, class_embeddings, adj_matrix, initial_temp=0.07):
+        super(GNNClassModel, self).__init__()
+        self.doc_encoder = AutoModel.from_pretrained(encoder_name)
+        
+        # Buffer로 등록하면 state_dict에 저장되고 GPU로 자동 이동됨 (업데이트는 안 됨)
+        self.register_buffer('adj', adj_matrix)
         
         self.num_classes, self.label_dim = class_embeddings.size()
-        # [중요] BERT 공간에 맞춰진 임베딩을 파라미터로 등록
-        self.label_embedding_weights = nn.Parameter(class_embeddings.clone(), requires_grad=True)
-
-        """self.projection = nn.Sequential(
-            nn.Linear(enc_dim, enc_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(enc_dim, enc_dim) # 다시 원래 차원으로
-        )"""
         
+        # Initial Embeddings (MPNet output) -> Input Feature for GNN
+        self.class_emb_input = nn.Parameter(class_embeddings.clone(), requires_grad=True)
+        
+        # GCN Layers (Dimension Preserving: 768 -> 768)
+        self.gc1 = GraphConvolution(enc_dim, enc_dim)
+        self.gc2 = GraphConvolution(enc_dim, enc_dim)
+        self.relu = nn.LeakyReLU(0.2)
+        self.dropout = nn.Dropout(0.1)
+        
+        # Learnable Temperature
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / initial_temp))
+
     def mean_pooling(self, model_output, attention_mask):
-        """
-        MPNet(SBERT) Standard Pooling Strategy
-        """
         token_embeddings = model_output.last_hidden_state
         input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
         sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, dim=1)
         sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
         return sum_embeddings / sum_mask
-    
+
     def forward(self, input_ids, attention_mask):
-        # 1. Document Encoding (MPNet)
-        outputs = self.doc_encoder(input_ids, attention_mask=attention_mask)
-        
-        # 2. Mean Pooling (Crucial for MPNet)
-        doc_vector = self.mean_pooling(outputs, attention_mask) # [Batch, 768]
-
-        # 3. Projection (Crucial for MPNet)
-        # doc_vector = self.projection(doc_vector)
-        
-        # 4. Normalization (Crucial for preventing Logit Explosion)
-        # MPNet은 Cosine Similarity 공간에서 학습되었으므로 정규화가 필수입니다.
+        # A. Document Encoding
+        doc_outputs = self.doc_encoder(input_ids, attention_mask=attention_mask)
+        doc_vector = self.mean_pooling(doc_outputs, attention_mask)
         doc_norm = F.normalize(doc_vector, p=2, dim=1)
-        label_norm = F.normalize(self.label_embedding_weights, p=2, dim=1)
         
-        # 5. Simple Dot Product (Cosine Similarity)
-        # LBM 없이 직접 내적합니다.
-        # 수식: Score = (Doc / |Doc|) * (Label / |Label|)^T
-        scores = torch.matmul(doc_norm, label_norm.T) # [Batch, Num_Classes]
+        # B. Label Encoding via GNN
+        # Layer 1
+        x = self.gc1(self.class_emb_input, self.adj)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = x + self.class_emb_input # Residual 1
         
-        # 6. Temperature Scaling
-        # Cosine Sim(-1~1)을 Sigmoid에 적합한 범위(예: -14~14)로 확장
-        # scores = scores / self.temperature
-        logit_scale = self.logit_scale.exp().clamp(max=100) 
-        scores = torch.matmul(doc_norm, label_norm.T) * logit_scale
+        # Layer 2
+        x = self.gc2(x, self.adj)
+        final_class_emb = x + self.class_emb_input # Residual 2
         
-        return scores
+        label_norm = F.normalize(final_class_emb, p=2, dim=1)
+        
+        # C. Classification
+        cosine_sim = torch.matmul(doc_norm, label_norm.T)
+        scale = self.logit_scale.exp().clamp(max=100)
+        
+        return cosine_sim * scale
 
-def multilabel_bce_loss_w(output, target, weight=None):
-    """if weight is None:
-        weight = torch.ones_like(output)
-    # reduction='sum' matches authors' code, normalizing by batch size manually if needed
-    loss = F.binary_cross_entropy_with_logits(output, target, weight, reduction="sum")
-    return loss / output.size(0)"""
-    # [Advanced] Asymmetric weighting (Focus on Positives)
-    # 정답(Target=1)인 경우 Loss를 더 크게 키움
-    
-    pos_weight = torch.ones_like(output) * 5.0  # 정답을 틀리면 5배 더 혼냄
-    
-    # reduction='mean'으로 변경하여 배치 크기에 따른 변동성을 줄임
-    loss = F.binary_cross_entropy_with_logits(
-        output, 
-        target, 
-        weight=weight, 
-        pos_weight=pos_weight, # <--- 핵심
-        reduction="mean" 
-    )
-    return loss
-
+# Loss Functions (기존 동일)
 def custom_focal_loss(inputs, targets, weight=None, alpha=1, gamma=2.0):
-    """
-    Focal Loss with Sample Weight support.
-    """
-    # 1. 기본 BCE 계산 (reduction='none'으로 개별 Loss 확보)
     bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-    
-    # 2. pt (정답 확률) 계산
     pt = torch.exp(-bce_loss)
-    
-    # 3. Focal Term ((1-pt)^gamma) 적용
     f_loss = alpha * (1 - pt) ** gamma * bce_loss
-    
-    # 4. Sample Mask (Weight) 적용
-    # 기존 코드의 sample_mask (Real/Aug 데이터 가중치 등)를 여기서 곱해줍니다.
     if weight is not None:
         f_loss = f_loss * weight
-        
     return f_loss.mean()
+
+# ============================================================================
+# UPDATED TRAINER
+# ============================================================================
+
+class TELEClassTrainer:
+    def __init__(self, num_classes, model_name, hidden_dim, class_embeddings, adj_matrix, device_ids=None):
+        self.available_gpus = device_ids if device_ids else list(range(torch.cuda.device_count()))
+        self.primary_device = f'cuda:{self.available_gpus[0]}' if self.available_gpus else 'cpu'
+        
+        # [MODIFIED] Initialize GNNClassModel instead of ClassModel
+        self.model = GNNClassModel(
+            encoder_name=model_name, 
+            enc_dim=hidden_dim, 
+            class_embeddings=class_embeddings,
+            adj_matrix=adj_matrix, # Pass adjacency matrix
+            initial_temp=0.07
+        )
+        
+        # Layer Freezing (Same strategy)
+        modules = [self.model.doc_encoder.embeddings, *self.model.doc_encoder.encoder.layer[:8]]
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = False
+        logger.info("Frozen MPNet layers 0-7. Training only top layers + GCN")
+        
+        self.model.to(self.primary_device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        if len(self.available_gpus) > 1:
+            self.model = DataParallel(self.model, device_ids=self.available_gpus)
+            
+        self.num_classes = num_classes
+
+    def train(self, train_texts, train_labels, train_mask, train_scaling, 
+              val_texts, val_labels, val_mask, val_scaling,
+              hierarchy_graph, epochs=5, lr=2e-5, batch_size=16, 
+              output_dir="outputs", patience=5):
+        
+        eff_batch_size = batch_size * max(1, len(self.available_gpus))
+        
+        # Dataset & Dataloader (Phase 0~4에서 정의된 클래스 사용 가정)
+        # 주의: WeightedMultiLabelDataset 클래스는 이전 코드에 정의되어 있어야 함
+        train_dataset = WeightedMultiLabelDataset(
+            train_texts, train_labels, self.tokenizer, hierarchy_graph, self.num_classes,
+            is_augmented_mask=train_mask, augmentation_scaling=train_scaling
+        )
+        val_dataset = WeightedMultiLabelDataset(
+            val_texts, val_labels, self.tokenizer, hierarchy_graph, self.num_classes,
+            is_augmented_mask=val_mask, augmentation_scaling=val_scaling
+        )
+
+        train_loader = TorchDataLoader(train_dataset, batch_size=eff_batch_size, shuffle=True, num_workers=4)
+        val_loader = TorchDataLoader(val_dataset, batch_size=eff_batch_size, shuffle=False, num_workers=4)
+
+        # Optimizer: GNN weights should have higher LR? (Optional, here using uniform LR)
+        optimizer = AdamW(filter(lambda p: p.requires_grad, self.model.parameters()), lr=lr, eps=1e-8)
+        
+        num_training_steps = len(train_loader) * epochs
+        scheduler = get_cosine_schedule_with_warmup(optimizer, int(num_training_steps*0.1), num_training_steps)
+        
+        best_f1_score = -1.0
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            self.model.train()
+            total_loss = 0
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+            
+            for batch in pbar:
+                input_ids = batch['input_ids'].to(self.primary_device)
+                attention_mask = batch['attention_mask'].to(self.primary_device)
+                labels = batch['labels'].to(self.primary_device)
+                sample_mask = batch['sample_mask'].to(self.primary_device)
+                
+                optimizer.zero_grad()
+                outputs = self.model(input_ids, attention_mask)
+                loss = custom_focal_loss(outputs, labels, sample_mask)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                
+                total_loss += loss.item()
+                pbar.set_postfix({'loss': loss.item()})
+            
+            # --- Validation ---
+            self.model.eval()
+            val_loss = 0
+            all_preds = []
+            all_targets = []
+            
+            with torch.no_grad():
+                for batch in tqdm(val_loader, desc="Validation"):
+                    input_ids = batch['input_ids'].to(self.primary_device)
+                    attention_mask = batch['attention_mask'].to(self.primary_device)
+                    labels = batch['labels'].to(self.primary_device)
+                    sample_mask = batch['sample_mask'].to(self.primary_device)
+                    
+                    outputs = self.model(input_ids, attention_mask)
+                    loss = custom_focal_loss(outputs, labels, weight=sample_mask)
+                    val_loss += loss.item()
+                    
+                    # Inference using learned temperature implicit in outputs
+                    probs = torch.sigmoid(outputs)
+                    preds = (probs > 0.5).long().cpu().numpy()
+                    targets = (labels > 0.5).long().cpu().numpy()
+                    
+                    all_preds.append(preds)
+                    all_targets.append(targets)
+
+            all_preds = np.vstack(all_preds)
+            all_targets = np.vstack(all_targets)
+            val_samples_f1 = f1_score(all_targets, all_preds, average='samples')
+            
+            logger.info(f"Epoch {epoch+1}: Val Loss={val_loss/len(val_loader):.4f}, Samples F1={val_samples_f1:.4f}")
+            self.save_model(os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}"))
+            print(f"Saved checkpoint to {output_dir}/checkpoint_epoch_{epoch+1}")
+            if val_samples_f1 > best_f1_score:
+                best_f1_score = val_samples_f1
+                patience_counter = 0
+                print(f"New Best Samples F1! ({best_f1_score:.4f}) Saving model to {output_dir}/best_model")
+                self.save_model(os.path.join(output_dir, "best_model"))
+            else:
+                patience_counter += 1
+                print(f"Patience {patience_counter}/{patience} - No improvement")
+                if patience_counter >= patience:
+                    print("Early stopping")
+                    break
+    
+    def save_model(self, path):
+        os.makedirs(path, exist_ok=True)
+        model_to_save = self.model.module if isinstance(self.model, DataParallel) else self.model
+        torch.save(model_to_save.state_dict(), os.path.join(path, "pytorch_model.bin"))
+        self.tokenizer.save_pretrained(path)
+        model_to_save.doc_encoder.config.save_pretrained(path)
+
+# ============================================================================
+# UPDATED INFERENCE HELPER
+# ============================================================================
+
+class CustomInference:
+    def __init__(self, model_path, class_embeddings, hierarchy_graph, device_ids=None):
+        self.device = f'cuda:{device_ids[0]}' if device_ids else 'cpu'
+        
+        # [MODIFIED] Inference 시에도 Adjacency Matrix 재구성 필요
+        num_classes = class_embeddings.size(0)
+        
+        adj_matrix = build_normalized_adjacency(
+            data_loader.hierarchy_graph, 
+            data_loader.all_classes,      # List of class names (defines index order)
+            data_loader.idx_to_class      # Mapping: Raw ID -> Class Name
+        )
+
+        # Load GNNClassModel Structure
+        # Model config (mpnet-base-v2) must match training
+        self.model = GNNClassModel(
+            "sentence-transformers/all-mpnet-base-v2", 
+            768, 
+            class_embeddings, 
+            adj_matrix
+        )
+        
+        # Load weights
+        self.model.load_state_dict(torch.load(os.path.join(model_path, "pytorch_model.bin")))
+        self.model.to(self.device)
+        self.model.eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.hierarchy_graph = hierarchy_graph
+
+    def predict(self, texts, batch_size=32, threshold=0.15):
+        # Inference logic remains similar, model forward handles GNN
+        dataset = WeightedMultiLabelDataset(
+            texts, [[]]*len(texts), self.tokenizer, self.hierarchy_graph, self.model.num_classes
+        )
+        dataloader = TorchDataLoader(dataset, batch_size=batch_size, shuffle=False)
+        
+        all_preds = []
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Inference"):
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch['attention_mask'].to(self.device)
+                
+                outputs = self.model(input_ids, attention_mask)
+                probs = torch.sigmoid(outputs)
+                preds = (probs > threshold).cpu().numpy()
+                for i, p in enumerate(preds):
+                    indices = np.where(p)[0].tolist()
+                    if not indices:
+                        indices = [torch.argmax(probs[i]).item()]
+                    all_preds.append(indices)
+        return all_preds
+    
+    def generate_submission(self, predictions, output_path="submission.csv"):
+        submission_data = []
+        for doc_id, label_indices in enumerate(predictions):
+            label_str = ",".join(map(str, label_indices))
+            submission_data.append({'id': doc_id, 'labels': label_str})
+        pd.DataFrame(submission_data).to_csv(output_path, index=False)
+
 
 # ============================================================================
 # UPDATED DATASET (Matches prepare_training_data.py logic)
@@ -315,224 +550,7 @@ def generate_bert_class_embeddings(model_name, class_list, class_descriptions, d
             
     return torch.cat(class_emb, dim=0)
 
-# ============================================================================
-# TRAINER CLASS
-# ============================================================================
 
-class TELEClassTrainer:
-    def __init__(self, num_classes, model_name, hidden_dim, class_embeddings, temperature=0.07, device_ids=None):
-        self.available_gpus = device_ids if device_ids else list(range(torch.cuda.device_count()))
-        self.primary_device = f'cuda:{self.available_gpus[0]}' if self.available_gpus else 'cpu'
-        self.hidden_dim = hidden_dim
-        self.model = ClassModel(model_name, self.hidden_dim, class_embeddings, temperature=0.07)
-        
-        # Layer Freezing
-        modules = [self.model.doc_encoder.embeddings, *self.model.doc_encoder.encoder.layer[:8]]
-        for module in modules:
-            for param in module.parameters():
-                param.requires_grad = False
-        logger.info("Frozen MPNet layers 0-7. Training only top layers")
-                
-        
-        self.model.to(self.primary_device)
-        
-        if len(self.available_gpus) > 1:
-            self.model = DataParallel(self.model, device_ids=self.available_gpus)
-            
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.num_classes = num_classes
-
-    def train(self, train_texts, train_labels, train_mask, train_scaling, # Train Data
-              val_texts, val_labels, val_mask, val_scaling,         # Validation Data
-              hierarchy_graph, epochs=5, lr=2e-5, batch_size=16, 
-              output_dir="outputs", patience=5, save_interval=5):
-        
-        eff_batch_size = batch_size * max(1, len(self.available_gpus))
-        
-        """dataset = WeightedMultiLabelDataset(
-            train_texts, train_labels, self.tokenizer, hierarchy_graph, self.num_classes,
-            is_augmented_mask=is_augmented_mask, augmentation_scaling=aug_scaling
-        )
-        dataloader = TorchDataLoader(dataset, batch_size=eff_batch_size, shuffle=True, num_workers=4)
-        """
-        
-
-        # 2. Dataset & DataLoader 생성
-        train_dataset = WeightedMultiLabelDataset(
-            train_texts, train_labels, self.tokenizer, hierarchy_graph, self.num_classes,
-            is_augmented_mask=train_mask, augmentation_scaling=train_scaling
-        )
-        val_dataset = WeightedMultiLabelDataset(
-            val_texts, val_labels, self.tokenizer, hierarchy_graph, self.num_classes,
-            is_augmented_mask=val_mask, augmentation_scaling=val_scaling
-        )
-
-        train_loader = TorchDataLoader(train_dataset, batch_size=eff_batch_size, shuffle=True, num_workers=4)
-        val_loader = TorchDataLoader(val_dataset, batch_size=eff_batch_size, shuffle=False, num_workers=4)
-
-        # Author's Optimizer Settings
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {"params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)], "weight_decay": 0.01},
-            {"params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
-        ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=lr, eps=1e-8)
-        
-        # Cosine Scheduler 추가
-        num_training_steps = len(train_loader) * epochs
-        num_warmup_steps = int(num_training_steps * 0.1) # 10% Warmup
-        
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps
-        )
-        
-        self.save_model(os.path.join(output_dir, f"checkpoint_epoch_0"))
-        self.model.train()
-        best_f1_score = -1.0 
-        patience_counter = 0
-
-        for epoch in range(epochs):
-            total_loss = 0
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-            
-            for batch in pbar:
-                input_ids = batch['input_ids'].to(self.primary_device)
-                attention_mask = batch['attention_mask'].to(self.primary_device)
-                labels = batch['labels'].to(self.primary_device)
-                sample_mask = batch['sample_mask'].to(self.primary_device)
-                
-                optimizer.zero_grad()
-                outputs = self.model(input_ids, attention_mask)
-                # loss = multilabel_bce_loss_w(outputs, labels, sample_mask)
-                loss = custom_focal_loss(outputs, labels, sample_mask)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                optimizer.step()
-
-                scheduler.step()
-                total_loss += loss.item()
-                pbar.set_postfix({'loss': loss.item()})
-            
-            avg_train_loss = total_loss / len(train_loader)
-
-            # --- Validation (F1 Score Calculation) ---
-            self.model.eval()
-            val_loss = 0
-            all_preds = []
-            all_targets = []
-            
-            with torch.no_grad():
-                for batch in tqdm(val_loader, desc=f"Epoch {epoch+1} [Val]"):
-                    input_ids = batch['input_ids'].to(self.primary_device)
-                    attention_mask = batch['attention_mask'].to(self.primary_device)
-                    labels = batch['labels'].to(self.primary_device)
-                    sample_mask = batch['sample_mask'].to(self.primary_device)
-                    
-                    outputs = self.model(input_ids, attention_mask)
-                    loss = custom_focal_loss(outputs, labels, weight=sample_mask, gamma=2.0)
-                    val_loss += loss.item()
-                    
-                    # F1 계산을 위한 예측값 수집 (Threshold 0.5)
-                    probs = torch.sigmoid(outputs)
-                    preds = (probs > 0.5).long().cpu().numpy()
-                    targets = (labels > 0.5).long().cpu().numpy() # Label Smoothing 대응
-                    
-                    all_preds.append(preds)
-                    all_targets.append(targets)
-
-            avg_val_loss = val_loss / len(val_loader)
-            
-            # Concatenate and Calculate F1
-            all_preds = np.vstack(all_preds)
-            all_targets = np.vstack(all_targets)
-            
-            # [CRITICAL FIX] Samples F1 Score 계산
-            # average='samples': 각 샘플마다 F1을 계산하고 그 평균을 냄 (Instance-wise evaluation)
-            val_samples_f1 = f1_score(all_targets, all_preds, average='samples')
-            
-            # 참고용 Micro/Macro F1
-            val_micro_f1 = f1_score(all_targets, all_preds, average='micro')
-            
-            logger.info(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, Val Loss={avg_val_loss:.4f}")
-            logger.info(f"          Samples F1 (Metric)={val_samples_f1:.4f}, Micro F1={val_micro_f1:.4f}")
-
-
-            logger.info(f"Saving model to {output_dir}/checkpoint_epoch_{epoch+1}")
-            self.save_model(os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}"))
-            
-            # [MODIFIED] Samples F1 기준으로 저장 및 Early Stopping
-            if val_samples_f1 > best_f1_score:
-                best_f1_score = val_samples_f1
-                patience_counter = 0
-                logger.info(f"New Best Samples F1! ({best_f1_score:.4f}) Saving model to {output_dir}/best_model")
-                self.save_model(os.path.join(output_dir, "best_model"))
-            else:
-                patience_counter += 1
-                logger.info(f"No F1 improvement. Patience {patience_counter}/{patience}")
-
-            if patience_counter >= patience:
-                logger.info(f"Early stopping triggered at score {best_f1_score:.4f}")
-                break
-            
-        logger.info(f"Training complete. Best Samples F1: {best_f1_score:.4f}")
-
-    def save_model(self, path):
-        os.makedirs(path, exist_ok=True)
-        model_to_save = self.model.module if isinstance(self.model, DataParallel) else self.model
-        torch.save(model_to_save.state_dict(), os.path.join(path, "pytorch_model.bin"))
-        self.tokenizer.save_pretrained(path)
-        model_to_save.doc_encoder.config.save_pretrained(path)
-
-# ============================================================================
-# INFERENCE HELPER
-# ============================================================================
-class CustomInference:
-    def __init__(self, model_path, class_embeddings, hierarchy_graph, device_ids=None):
-        self.device = f'cuda:{device_ids[0]}' if device_ids else 'cpu'
-        self.hierarchy_graph = hierarchy_graph
-        # Inference 시에도 동일한 구조 초기화 필요
-        self.model = ClassModel("bert-base-uncased", 768, class_embeddings)
-        self.model.load_state_dict(torch.load(os.path.join(model_path, "pytorch_model.bin")))
-        self.model.to(self.device)
-        self.model.eval()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-    def predict(self, texts, batch_size=32, threshold=0.15): # Threshold 낮춤
-        # Inference에서는 Mask 불필요
-        dataset = WeightedMultiLabelDataset(
-            texts, [[]]*len(texts), self.tokenizer, self.hierarchy_graph, self.model.num_classes
-        )
-        dataloader = TorchDataLoader(dataset, batch_size=batch_size, shuffle=False)
-        
-        all_preds = []
-        with torch.no_grad():
-            for batch in tqdm(dataloader, desc="Inference"):
-                input_ids = batch['input_ids'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                
-                outputs = self.model(input_ids, attention_mask)
-                probs = torch.sigmoid(outputs)
-                preds = (probs > threshold).cpu().numpy()
-                for i, p in enumerate(preds):
-                    indices = np.where(p)[0].tolist()
-                    if not indices:
-                        indices = [torch.argmax(probs[i]).item()]
-                    all_preds.append(indices)
-        return all_preds
-
-    def generate_submission(self, predictions, idx_to_class, output_path="submission.csv"):
-        # [FIXED] Added this method to match pipeline call
-        logger.info(f"Generating submission file: {output_path}")
-        submission_data = []
-        for doc_id, label_indices in enumerate(predictions):
-            label_str = ",".join(map(str, label_indices))
-            submission_data.append({'id': doc_id, 'labels': label_str})
-
-        df = pd.DataFrame(submission_data)
-        df.to_csv(output_path, index=False)
-        logger.info(f"Submission saved: {output_path}")
 
 # ============================================================================
 # GPU UTILITIES
@@ -1263,10 +1281,12 @@ class MultiGPUTELEClassPipeline:
         avg_labels = np.mean([len(l) for l in expanded_labels])
         print(f"Average Labels after Expansion: {avg_labels}")
         
-        # Phase 5: Custom TELEClass Training
+        # Phase 5: CUSTOM MODEL TRAINING (Using MPNet Backbone + GCN)
         logger.info("\n" + "="*80)
-        logger.info("PHASE 5: CUSTOM MODEL TRAINING")
+        logger.info("PHASE 5: GNN-ENHANCED MODEL TRAINING")
         logger.info("="*80)
+
+        
 
         # 1. [CRITICAL FIX] BERT 기반 Class Embedding 새로 생성
         # Phase 2(MPNet) 결과는 버리고, BERT 공간에서 새로 만듭니다.
@@ -1290,16 +1310,16 @@ class MultiGPUTELEClassPipeline:
         aug_scaling = 1.0
         logger.info(f"Augmentation Scaling Factor: {aug_scaling:.4f}")
 
-        # 4. Initialize Trainer
-        # Phase 5: Custom TELEClass Training
-        logger.info("\n" + "="*80)
-        logger.info("PHASE 5: CUSTOM MODEL TRAINING (Using MPNet Backbone)")
-        logger.info("="*80)
+        # [NEW] Build Adjacency Matrix
+        adj_matrix = build_normalized_adjacency(
+            data_loader.hierarchy_graph, 
+            data_loader.all_classes,      # List of class names (defines index order)
+            data_loader.idx_to_class      # Mapping: Raw ID -> Class Name
+        )
 
-        # [CRITICAL FIX 1] Backbone Model 변경 (BERT -> MPNet)
-        # LLM 설명의 뉘앙스를 이해하려면 SBERT 계열을 써야 합니다.
-        target_model_name = "sentence-transformers/all-mpnet-base-v2"
         
+        target_model_name = "sentence-transformers/all-mpnet-base-v2"
+        config = AutoConfig.from_pretrained(target_model_name)
         # [CRITICAL FIX 2] Class Embedding 생성 방식 변경
         # 별도의 함수(generate_bert...)를 쓰지 말고, 
         # Phase 1에서 썼던 class_repr.encode_classes를 그대로 재사용합니다.
@@ -1349,16 +1369,14 @@ class MultiGPUTELEClassPipeline:
         logger.info(f"  - Final Train Size: {len(final_train_texts)} (Real: {len(real_train_texts)} + Aug: {len(augmented_texts)})")
         logger.info(f"  - Clean Val Size:   {len(val_texts)} (All Real)")
 
-        # 4. Initialize Trainer with MPNet Config
-        config = AutoConfig.from_pretrained(target_model_name)
         
         trainer = TELEClassTrainer(
             num_classes=len(data_loader.all_classes),
-            hidden_dim=config.hidden_size, # MPNet hidden size (768)
-            model_name=target_model_name, # [중요] BERT 대신 MPNet 로드
-            class_embeddings=final_class_embeddings, # MPNet으로 만든 임베딩
-            device_ids=self.device_ids,
-            temperature=0.1 # 학습 안정화용 온도
+            hidden_dim=config.hidden_size,
+            model_name=target_model_name,
+            class_embeddings=final_class_embeddings,
+            adj_matrix=adj_matrix,  # [Pass Adjacency]
+            device_ids=self.device_ids
         )
         
         # 5. Train
@@ -1381,7 +1399,7 @@ class MultiGPUTELEClassPipeline:
         """logger.info("PHASE 6: CUSTOM MODEL INFERENCE")
         inference = CustomInference(
             os.path.join(self.output_dir, "models", "best_model"),
-            bert_class_embeddings, # Inference 때도 구조 초기화를 위해 필요
+            final_class_embeddings, # Need base embeddings to initialize
             data_loader.hierarchy_graph,
             device_ids=self.device_ids
         )
