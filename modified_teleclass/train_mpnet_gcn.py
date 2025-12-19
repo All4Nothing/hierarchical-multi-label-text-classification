@@ -755,6 +755,7 @@ class MultiGPUClassRepresentation:
             with open(cache_file, 'r', encoding='utf-8') as f:
                 descriptions = json.load(f)
             logger.info(f"Loaded {len(descriptions)} cached descriptions")
+            print(f"Cached descriptions: {list(descriptions.items())[:5]}")
             return descriptions
 
         # 그래프 탐색을 위해 이름을 ID로 매핑하는 역방향 딕셔너리 생성 (필요시)
