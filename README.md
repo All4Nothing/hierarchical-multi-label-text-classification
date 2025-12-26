@@ -9,6 +9,5 @@ beam search inference strategy significantly outperforms bottom-up approaches by
 consistency. Our method achieves a Sample F1 score of 0.63578 on the Amazon Product Review dataset[1],
 showing substantial improvement over the baseline (0.39180). We also analyze the limitations of Graph Neural
 Networks (GNNs) in this specific semantic space, providing empirical evidence of reduced distinctiveness.
-Our code and data are available at: https://github.com/All4Nothing/20252R0136DATA30400.
 Additional Key Words and Phrases: Hierarchical Classification, Weakly Supervised Learning, Data Augmenta-
 tion, LLM, Self-Training
